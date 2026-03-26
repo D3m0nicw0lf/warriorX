@@ -1,39 +1,160 @@
-# WARRIOR
+# WarriorX (Apex Mode)
 
-WARRIOR is a read-only Linux exposure review script written as a single Bash file.
+### Linux Privilege Escalation Intelligence Tool
 
-It is meant for local enumeration and reporting. The script does not modify the host, run exploits, or print copy-paste privilege escalation commands.
+---
+
+## What is this?
+
+WarriorX is a Linux privilege escalation tool built with a simple goal:
+
+> Don’t just show everything — show what actually matters.
+
+Most tools dump a huge amount of data and leave the operator to figure things out.
+WarriorX takes a different approach — it focuses on **clarity, prioritization, and reasoning**.
+
+---
+
+## Why I built this
+
+While working on CTFs and real targets, I noticed a common problem:
+
+* Tools like LinPEAS are powerful
+* But they are **noisy and overwhelming**
+
+You still end up spending time figuring out:
+
+* What is important?
+* What should I try first?
+* Which finding is actually exploitable?
+
+WarriorX is built to reduce that gap.
+
+---
 
 ## What it does
 
-WARRIOR reviews a Linux system and highlights findings that may deserve attention during a security assessment. It focuses on readable output and simple prioritization.
+WarriorX performs a full privilege escalation audit and then:
 
-The script reports:
+* Highlights **high-risk findings**
+* Groups related issues together
+* Suggests **where to focus first**
+* Detects **possible attack paths (hint-based)**
 
-- confidence grading
-- likely impact
-- service-chain observations
-- ACL and parent-directory issues
-- secret-related findings
-- correlated risk paths
-- an overall machine risk score
+It does **not** try to exploit anything.
+It helps you think better.
+
+---
+
+## Features
+
+### Core Coverage
+
+* SUID / SGID binaries
+* Sudo rules (including deeper checks)
+* File capabilities
+* Writable files and directories
+* Cron jobs and scheduled tasks
+* Services and systemd units
+* Environment and PATH issues
+* Container exposure (Docker / LXD)
+* Credential discovery (keys, env files, history)
+
+---
+
+### Intelligence Layer
+
+* Structured findings (no spam)
+* Deduplicated output
+* Priority-based results
+* Simple risk scoring
+* Context detection (HTB / container / real system)
+
+---
+
+### Apex Mode (Advanced)
+
+* Attack chain hints (no exploitation)
+* Easy-win detection
+* Top priority targets section
+* Kernel awareness (basic CVE hints)
+
+---
 
 ## Usage
 
 ```bash
-bash warrior.sh
-bash warrior.sh --quick
-bash warrior.sh --normal
-bash warrior.sh --deep
-bash warrior.sh --deep --no-color
+chmod +x warriorx.sh
+./warriorx.sh
 ```
 
-## Scan modes
+That’s it. No dependencies, no setup.
 
-- `quick` keeps the run short and covers the basics
-- `normal` adds service and secret checks
-- `deep` adds ACL and parent-directory review
+---
 
-## Notes
+## Output Style
 
-All findings require manual validation.
+WarriorX avoids dumping raw data.
+
+Instead, it gives:
+
+* **What was found**
+* **Why it matters**
+* **What to check next**
+
+This makes it:
+
+* easier to use in CTFs
+* more practical in real environments
+* better for learning
+
+---
+
+## Comparison with LinPEAS
+
+| Area             | WarriorX | LinPEAS |
+| ---------------- | -------- | ------- |
+| Coverage         | High     | High    |
+| Noise            | Low      | High    |
+| Prioritization   | Yes      | No      |
+| Attack hints     | Yes      | No      |
+| Decision support | Strong   | Basic   |
+
+LinPEAS is still excellent for raw enumeration.
+WarriorX is built for **decision-making**.
+
+---
+
+## What this tool is NOT
+
+* It does not run exploits
+* It does not give copy-paste payloads
+* It does not replace manual analysis
+
+It’s designed to **assist**, not automate everything.
+
+---
+
+## Disclaimer
+
+Use this tool only on systems you are authorized to test.
+The author is not responsible for misuse.
+
+---
+
+## Author
+
+Abhay Victor
+Cybersecurity | Bug Bounty | CTF
+
+---
+
+## Final Note
+
+This project is still evolving.
+
+The goal is not to compete blindly with existing tools,
+but to build something that actually helps during real assessments.
+
+If it saves you time or gives you better direction,
+then it’s doing its job.
