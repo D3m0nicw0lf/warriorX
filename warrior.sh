@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # WarriorX
 
-
 VERSION="1.1"
 
 USE_COLOR=1
